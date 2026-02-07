@@ -46,7 +46,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pytzcvrt.json")
-__version__ = "0.9.0"
+__version__ = "0.9.3"
 DEFAULT_SELECTED = [
     "Asia/Baghdad",
     "Europe/Stockholm",
@@ -1364,10 +1364,7 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
         return x + width + 1
 
     line = 0
-    settings_header = (
-        "Settings (s=save, q=cancel, c=colors, t=theme, Tab=focus, o=sort, v=view, "
-        "b=box, m=mouse, ?=help, click/scroll)"
-    )
+    settings_header = "Settings (o=sort, v=view)"
     for text in wrap_text_lines(settings_header, iw):
         add(line, 0, text, "header")
         line += 1
@@ -2256,12 +2253,15 @@ def handle_settings_input(key: int, state: dict) -> bool:
         state["view_mode"] = (state["view_mode"] + 1) % len(VIEW_MODES)
         state["all_idx"] = 0
         state["all_scroll"] = 0
+        if state["view_mode"] == 0:
+            state["settings_msg"] = ""
         state["all_scroll_manual"] = False
         return True
 
     if key in (ord("o"), ord("O")):
         if state["view_mode"] == 0:
             state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
+            state["settings_msg"] = ""
             state["all_scroll_manual"] = False
         else:
             state["settings_msg"] = "Sort modes only in flat view."
