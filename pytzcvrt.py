@@ -1,26 +1,52 @@
 #!/usr/bin/env python3
 """
-Dynamic time zone TUI (curses + zoneinfo).
+pytzcvrt: Terminal TUI for time zone display and span conversion.
 
-- ASCII-only UI
-- Configurable list of selected time zones
-- Settings modal with filter, add/remove, reorder, and sorting
-- Country-grouped browsing mode using tzdata mapping files
+Key features:
+- Live "now" clock and span conversion across a user-selected list of time zones.
+- Settings window to manage selected zones, with flat view or country view.
+- Country view includes aliases inferred from zoneinfo links (canonical tzdata
+  tables omit aliases).
+- Mouse support: click to focus, click buttons, wheel scroll.
+- Optional color themes and ASCII/Unicode box drawing (with safe fallback).
+
+Key bindings (main):
+- s: Settings   r: Reset   q: Quit   Tab/Shift-Tab: navigate fields
+- Up/Down: change From TZ   Enter in Start/End: next field
+- Mouse: click fields/buttons; wheel scroll results; click results cells
+
+Key bindings (Settings):
+- Tab/Shift-Tab: focus filter/all/selected panes
+- s: Save   q: Cancel   c: Colors on/off   t: Theme
+- v: View (flat/country)   o: Sort (flat view)
+- a/Enter: Add   d/Delete: Remove   u/j: reorder selected
+
+Config:
+- Stored at ~/.pytzcvrt.json by default (override with --config)
+- Keys: selected (list), box_drawing, colors_enabled, theme
+
+Limitations:
+- Curses behavior varies by terminal; Unicode box drawing requires UTF-8 support.
+- Colors/themes are optional and depend on terminal capabilities.
 """
 
 from __future__ import annotations
 
+import argparse
 import curses
 import json
 import locale
 import os
 import sys
+import textwrap
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pytzcvrt.json")
+__version__ = "0.9.0"
 DEFAULT_SELECTED = [
     "Asia/Baghdad",
     "Europe/Stockholm",
@@ -31,6 +57,7 @@ DEFAULT_SELECTED = [
 TZDATA_ZONE1970 = "/usr/share/zoneinfo/zone1970.tab"
 TZDATA_ZONE = "/usr/share/zoneinfo/zone.tab"
 TZDATA_ISO = "/usr/share/zoneinfo/iso3166.tab"
+ZONEINFO_DIR = "/usr/share/zoneinfo"
 
 INPUT_FMT = "%Y-%m-%d %H:%M"
 INPUT_DISPLAY = "YYYY-MM-DD HH:MM"
@@ -51,7 +78,7 @@ SORT_MODES = [
 VIEW_MODES = ["flat", "country"]
 
 # Box drawing styles (ASCII default, Unicode optional).
-# Settings toggles this and we apply on Save via apply_box_mode().
+# Settings can toggle at runtime; unsupported Unicode falls back to ASCII.
 BOX_STYLES = {
     "ascii": {
         "tl": "+",
@@ -85,18 +112,83 @@ BOX_STYLES = {
 MOUSE_REPORT_POS = getattr(curses, "REPORT_MOUSE_POSITION", 0)
 MOUSE_MASK = curses.ALL_MOUSE_EVENTS | MOUSE_REPORT_POS
 
-CP_HEADER = 1
-CP_BORDER = 2
-CP_BUTTON = 3
+# Semantic color roles used across the UI.
+ROLE_ORDER = [
+    "base",
+    "header",
+    "border",
+    "field",
+    "focus",
+    "button",
+    "button_focus",
+    "dropdown_bg",
+    "dropdown_sel",
+    "error",
+]
+
+THEMES = {
+    "default": {
+        "roles": {
+            "base": (curses.COLOR_WHITE, -1, 0),
+            "header": (curses.COLOR_CYAN, -1, curses.A_BOLD),
+            "border": (curses.COLOR_YELLOW, -1, curses.A_BOLD),
+            "field": (curses.COLOR_WHITE, -1, 0),
+            "focus": (curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_REVERSE | curses.A_BOLD),
+            "button": (curses.COLOR_GREEN, -1, 0),
+            "button_focus": (curses.COLOR_BLACK, curses.COLOR_GREEN, curses.A_REVERSE | curses.A_BOLD),
+            "dropdown_bg": (curses.COLOR_WHITE, curses.COLOR_BLUE, 0),
+            "dropdown_sel": (curses.COLOR_BLACK, curses.COLOR_CYAN, curses.A_REVERSE | curses.A_BOLD),
+            "error": (curses.COLOR_RED, -1, curses.A_BOLD),
+        },
+    },
+    "high_contrast": {
+        "roles": {
+            "base": (curses.COLOR_WHITE, curses.COLOR_BLACK, 0),
+            "header": (curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD),
+            "border": (curses.COLOR_WHITE, curses.COLOR_BLACK, curses.A_BOLD),
+            "field": (curses.COLOR_WHITE, curses.COLOR_BLACK, 0),
+            "focus": (curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_REVERSE | curses.A_BOLD),
+            "button": (curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_BOLD),
+            "button_focus": (curses.COLOR_WHITE, curses.COLOR_BLACK, curses.A_REVERSE | curses.A_BOLD),
+            "dropdown_bg": (curses.COLOR_WHITE, curses.COLOR_BLACK, 0),
+            "dropdown_sel": (curses.COLOR_BLACK, curses.COLOR_WHITE, curses.A_REVERSE | curses.A_BOLD),
+            "error": (curses.COLOR_RED, curses.COLOR_BLACK, curses.A_BOLD),
+        },
+    },
+    "hacker_green_black": {
+        "roles": {
+            "base": (curses.COLOR_GREEN, curses.COLOR_BLACK, 0),
+            "header": (curses.COLOR_GREEN, curses.COLOR_BLACK, curses.A_BOLD),
+            "border": (curses.COLOR_GREEN, curses.COLOR_BLACK, curses.A_BOLD),
+            "field": (curses.COLOR_GREEN, curses.COLOR_BLACK, 0),
+            "focus": (curses.COLOR_BLACK, curses.COLOR_GREEN, curses.A_REVERSE | curses.A_BOLD),
+            "button": (curses.COLOR_GREEN, curses.COLOR_BLACK, 0),
+            "button_focus": (curses.COLOR_BLACK, curses.COLOR_GREEN, curses.A_REVERSE | curses.A_BOLD),
+            "dropdown_bg": (curses.COLOR_GREEN, curses.COLOR_BLACK, 0),
+            "dropdown_sel": (curses.COLOR_BLACK, curses.COLOR_GREEN, curses.A_REVERSE | curses.A_BOLD),
+            "error": (curses.COLOR_RED, curses.COLOR_BLACK, curses.A_BOLD),
+        },
+    },
+}
+THEME_NAMES = list(THEMES.keys())
 
 
 @dataclass
 class Row:
     kind: str  # 'header' or 'tz'
     label: str
-    tz_name: str | None = None
+    tz_id: str | None = None
+    is_alias: bool = False
+    alias_target: str | None = None
     country_name: str | None = None
     country_code: str | None = None
+
+
+@dataclass
+class ZoneEntry:
+    tz_id: str
+    is_alias: bool = False
+    alias_target: str | None = None
 
 
 # -----------------------------
@@ -180,9 +272,11 @@ def cursor_from_click(rel: int) -> int:
 # Config
 # -----------------------------
 
-def load_config(all_zones: set[str]) -> tuple[list[str], str]:
+def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str]:
     selected: list[str] = []
     box_mode = "ascii"
+    colors_enabled: bool | None = None
+    theme_name = "default"
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -194,6 +288,11 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str]:
                 mode = data.get("box_drawing")
                 if isinstance(mode, str) and mode.lower() in ("ascii", "unicode"):
                     box_mode = mode.lower()
+                if isinstance(data.get("colors_enabled"), bool):
+                    colors_enabled = data["colors_enabled"]
+                theme = data.get("theme")
+                if isinstance(theme, str) and theme in THEMES:
+                    theme_name = theme
     except FileNotFoundError:
         pass
     except Exception:
@@ -207,13 +306,22 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str]:
     if not selected and "UTC" in all_zones:
         selected.append("UTC")
 
-    return selected, box_mode
+    return selected, box_mode, colors_enabled, theme_name
 
 
-def save_config(selected: list[str], box_mode: str) -> None:
+def save_config(selected: list[str], box_mode: str, colors_enabled: bool, theme_name: str) -> None:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump({"selected": selected, "box_drawing": box_mode}, f, indent=2)
+            json.dump(
+                {
+                    "selected": selected,
+                    "box_drawing": box_mode,
+                    "colors_enabled": colors_enabled,
+                    "theme": theme_name,
+                },
+                f,
+                indent=2,
+            )
     except Exception:
         pass
 
@@ -222,7 +330,9 @@ def save_config(selected: list[str], box_mode: str) -> None:
 # tzdata country mapping
 # -----------------------------
 
-def load_country_timezones(all_zones: set[str]) -> tuple[dict[tuple[str, str], list[str]], str | None]:
+def load_country_timezones(
+    all_zones: set[str],
+) -> tuple[dict[tuple[str, str], list[ZoneEntry]], str | None]:
     # Parse iso3166.tab
     iso_map: dict[str, str] = {}
     try:
@@ -244,6 +354,7 @@ def load_country_timezones(all_zones: set[str]) -> tuple[dict[tuple[str, str], l
     else:
         return {}, "tzdata zone file not found"
 
+    # Canonical mapping from tzdata tables (these files omit aliases).
     mapping: dict[tuple[str, str], set[str]] = {}
     try:
         with open(zone_file, "r", encoding="utf-8") as f:
@@ -264,40 +375,129 @@ def load_country_timezones(all_zones: set[str]) -> tuple[dict[tuple[str, str], l
     except Exception as exc:
         return {}, f"Failed to read {zone_file}: {exc}"
 
-    final: dict[tuple[str, str], list[str]] = {}
+    canonical_lists: dict[tuple[str, str], list[str]] = {}
+    canonical_set: set[str] = set()
     for key, tzs in mapping.items():
-        final[key] = sorted(tzs)
+        canonical_lists[key] = sorted(tzs)
+        canonical_set.update(canonical_lists[key])
 
-    if not final:
-        return {}, "No country/timezone mappings found"
+    if not canonical_lists:
+        return {}, "No country/time zone mappings found"
+
+    # Build ZoneEntry mapping (canonical tzdata lists; aliases added later).
+    final: dict[tuple[str, str], list[ZoneEntry]] = {}
+    for key, tzs in canonical_lists.items():
+        entries = [ZoneEntry(tz_id=tz, is_alias=False) for tz in tzs]
+        entries.sort(key=lambda e: e.tz_id)
+        final[key] = entries
+
+    # Build realpath index for canonical zones so we can attach aliases
+    # to the same country as their canonical targets.
+    # Aliases are not listed in zone1970.tab/zone.tab, so we infer by
+    # resolving zoneinfo paths and matching real paths.
+    zoneinfo_dir = Path(ZONEINFO_DIR)
+    realpath_to_country: dict[Path, tuple[str, str]] = {}
+    realpath_to_canonical: dict[Path, str] = {}
+    realpath_score: dict[Path, int] = {}
+    unmapped: set[str] = {tz for tz in all_zones if tz not in canonical_set}
+
+    if zoneinfo_dir.exists():
+        for key, tzs in canonical_lists.items():
+            for tz in tzs:
+                p = zoneinfo_dir / tz
+                if not p.exists():
+                    continue
+                try:
+                    real = p.resolve()
+                except Exception:
+                    continue
+                is_link = False
+                try:
+                    is_link = p.is_symlink()
+                except OSError:
+                    is_link = False
+                score = 1 if not is_link else 0
+                prev = realpath_score.get(real, -1)
+                if score > prev:
+                    realpath_to_country[real] = key
+                    realpath_to_canonical[real] = tz
+                    realpath_score[real] = score
+
+        for tz in sorted(list(unmapped)):
+            p = zoneinfo_dir / tz
+            if not p.exists():
+                continue
+            try:
+                real = p.resolve()
+            except Exception:
+                continue
+            if real in realpath_to_country:
+                key = realpath_to_country[real]
+                alias_target = realpath_to_canonical.get(real)
+                final.setdefault(key, []).append(
+                    ZoneEntry(tz_id=tz, is_alias=True, alias_target=alias_target)
+                )
+                unmapped.discard(tz)
+
+    # Intermix aliases and canonical zones by sorting within each country list.
+    for key, entries in final.items():
+        entries.sort(key=lambda e: e.tz_id)
+
+    if unmapped:
+        other_key = ("Other/Unmapped", "ZZ")
+        # Keep any aliases that cannot be inferred under a visible group.
+        final.setdefault(other_key, [])
+        for tz in sorted(unmapped):
+            final[other_key].append(ZoneEntry(tz_id=tz, is_alias=False))
+        final[other_key].sort(key=lambda e: e.tz_id)
 
     return final, None
 
 
-def build_country_rows(mapping: dict[tuple[str, str], list[str]], filter_text: str) -> list[Row]:
+def build_country_rows(mapping: dict[tuple[str, str], list[ZoneEntry]], filter_text: str) -> list[Row]:
     rows: list[Row] = []
     filt = filter_text.strip().lower()
 
-    for (country_name, cc) in sorted(mapping.keys(), key=lambda k: (k[0], k[1])):
-        tzs = mapping[(country_name, cc)]
+    # Country view rows include canonical zones and inferred aliases.
+    def sort_key(key: tuple[str, str]) -> tuple[int, str, str]:
+        country_name, cc = key
+        return (1 if cc == "ZZ" else 0, country_name, cc)
+
+    for (country_name, cc) in sorted(mapping.keys(), key=sort_key):
+        entries = mapping[(country_name, cc)]
         country_match = False
         if filt:
             if filt in country_name.lower() or filt in cc.lower():
                 country_match = True
 
-        matched_tzs: list[str] = []
+        matched_entries: list[ZoneEntry] = []
         if not filt:
-            matched_tzs = list(tzs)
+            matched_entries = list(entries)
         else:
-            for tz in tzs:
-                if filt in tz.lower() or country_match:
-                    matched_tzs.append(tz)
+            for entry in entries:
+                tz = entry.tz_id
+                alias_target = entry.alias_target or ""
+                if filt in tz.lower() or filt in alias_target.lower() or country_match:
+                    matched_entries.append(entry)
 
-        if matched_tzs:
+        if matched_entries:
             header = f"{country_name} ({cc})"
             rows.append(Row("header", header, country_name=country_name, country_code=cc))
-            for tz in matched_tzs:
-                rows.append(Row("tz", f"  {tz}", tz_name=tz, country_name=country_name, country_code=cc))
+            for entry in matched_entries:
+                label = f"  {entry.tz_id}"
+                if entry.is_alias:
+                    label += " (alias)"
+                rows.append(
+                    Row(
+                        "tz",
+                        label,
+                        tz_id=entry.tz_id,
+                        is_alias=entry.is_alias,
+                        alias_target=entry.alias_target,
+                        country_name=country_name,
+                        country_code=cc,
+                    )
+                )
 
     return rows
 
@@ -401,11 +601,18 @@ def safe_addstr(stdscr: curses.window, y: int, x: int, text: str, attr: int = 0)
     if y == h - 1 and x == w - 1:
         return
     max_len = w - x
-    if y == h - 1:
+    if y == h - 1 and x + max_len - 1 >= w - 1:
         max_len -= 1
     if max_len <= 0:
         return
     stdscr.addstr(y, x, text[:max_len], attr)
+
+
+def wrap_text_lines(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return [""]
+    lines = textwrap.wrap(text, width=width, break_long_words=True, break_on_hyphens=False)
+    return lines or [""]
 
 
 def add_region(
@@ -441,16 +648,17 @@ def draw_button(
     label_rest: str,
     focused: bool = False,
     enabled: bool = True,
-    color_pair: int | None = None,
+    base_attr: int = 0,
+    focus_attr: int | None = None,
 ) -> int:
     # Underline only the key character inside brackets: "[" + key + "]" + rest
     # This remains ASCII-only; underline is an attribute, not a glyph.
     key = key_char[:1] if key_char else " "
-    base_attr = 0
-    if color_pair:
-        base_attr |= curses.color_pair(color_pair)
     if focused:
-        base_attr |= curses.A_REVERSE
+        if focus_attr is not None:
+            base_attr = focus_attr
+        else:
+            base_attr |= curses.A_REVERSE
     if not enabled:
         base_attr |= curses.A_DIM
     underline_attr = base_attr | curses.A_UNDERLINE
@@ -471,55 +679,58 @@ def draw_field(
     width: int,
     focused: bool,
     cursor_pos: int,
+    label_attr: int = 0,
+    field_attr: int = 0,
+    cursor_attr: int = 0,
 ) -> tuple[int, tuple[int, int] | None]:
     label_text = f"{label}: "
-    safe_addstr(stdscr, y, x, label_text)
+    safe_addstr(stdscr, y, x, label_text, label_attr)
     x += len(label_text)
 
-    safe_addstr(stdscr, y, x, "[")
+    safe_addstr(stdscr, y, x, "[", field_attr)
     x += 1
 
     display = (value + " " * width)[:width]
-    safe_addstr(stdscr, y, x, display)
+    safe_addstr(stdscr, y, x, display, field_attr)
 
     cursor = None
     if focused:
         cur_idx = max(0, min(cursor_pos, width - 1))
         cursor_x = x + cur_idx
         cursor = (y, cursor_x)
-        safe_addstr(stdscr, y, cursor_x, display[cur_idx], curses.A_REVERSE)
+        safe_addstr(stdscr, y, cursor_x, display[cur_idx], cursor_attr)
 
     x += width
-    safe_addstr(stdscr, y, x, "]")
+    safe_addstr(stdscr, y, x, "]", field_attr)
     x += 1
 
     return x, cursor
 
 
-def draw_hline(stdscr: curses.window, y: int, x: int, length: int, ch: str) -> None:
+def draw_hline(stdscr: curses.window, y: int, x: int, length: int, ch: str, attr: int = 0) -> None:
     if length <= 0:
         return
-    safe_addstr(stdscr, y, x, ch * length)
+    safe_addstr(stdscr, y, x, ch * length, attr)
 
 
-def draw_vline(stdscr: curses.window, y: int, x: int, length: int, ch: str) -> None:
+def draw_vline(stdscr: curses.window, y: int, x: int, length: int, ch: str, attr: int = 0) -> None:
     for i in range(max(0, length)):
-        safe_addstr(stdscr, y + i, x, ch)
+        safe_addstr(stdscr, y + i, x, ch, attr)
 
 
-def draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, style: dict) -> None:
+def draw_box(stdscr: curses.window, y: int, x: int, h: int, w: int, style: dict, attr: int = 0) -> None:
     if h < 2 or w < 2:
         return
-    draw_hline(stdscr, y, x + 1, w - 2, style["h"])
-    draw_hline(stdscr, y + h - 1, x + 1, w - 2, style["h"])
-    draw_vline(stdscr, y + 1, x, h - 2, style["v"])
-    draw_vline(stdscr, y + 1, x + w - 1, h - 2, style["v"])
+    draw_hline(stdscr, y, x + 1, w - 2, style["h"], attr)
+    draw_hline(stdscr, y + h - 1, x + 1, w - 2, style["h"], attr)
+    draw_vline(stdscr, y + 1, x, h - 2, style["v"], attr)
+    draw_vline(stdscr, y + 1, x + w - 1, h - 2, style["v"], attr)
     def addch_try(yy: int, xx: int, ch: str) -> None:
         hh, ww = stdscr.getmaxyx()
         if yy < 0 or yy >= hh or xx < 0 or xx >= ww:
             return
         try:
-            stdscr.addstr(yy, xx, ch)
+            stdscr.addstr(yy, xx, ch, attr)
         except curses.error:
             pass
     addch_try(y, x, style["tl"])
@@ -598,18 +809,52 @@ def set_mouse_enabled(state: dict, enabled: bool) -> bool:
     return False
 
 
-def init_colors(state: dict) -> None:
-    state["colors"] = False
+def init_color_support(state: dict) -> None:
+    state["colors_supported"] = False
+    state["role_pairs"] = {}
     if curses.has_colors():
         try:
             curses.start_color()
             curses.use_default_colors()
-            curses.init_pair(CP_HEADER, curses.COLOR_CYAN, -1)
-            curses.init_pair(CP_BORDER, curses.COLOR_YELLOW, -1)
-            curses.init_pair(CP_BUTTON, curses.COLOR_GREEN, -1)
-            state["colors"] = True
+            state["colors_supported"] = True
         except curses.error:
-            state["colors"] = False
+            state["colors_supported"] = False
+
+
+def setup_theme_colors(state: dict) -> None:
+    state["role_pairs"] = {}
+    if not (state.get("colors_supported") and state.get("colors_enabled")):
+        return
+    theme = THEMES.get(state.get("theme_name"), THEMES["default"])
+    for idx, role in enumerate(ROLE_ORDER, start=1):
+        fg, bg, _attr = theme["roles"].get(role, theme["roles"]["base"])
+        try:
+            curses.init_pair(idx, fg, bg)
+            state["role_pairs"][role] = idx
+        except curses.error:
+            continue
+
+
+def role_attr(state: dict, role: str, extra: int = 0) -> int:
+    theme = THEMES.get(state.get("theme_name"), THEMES["default"])
+    fg, bg, base = theme["roles"].get(role, theme["roles"]["base"])
+    attr = base
+    if state.get("colors_enabled") and state.get("colors_supported"):
+        pair = state.get("role_pairs", {}).get(role)
+        if pair:
+            attr |= curses.color_pair(pair)
+    return attr | extra
+
+
+def apply_color_settings(state: dict, enabled: bool, theme_name: str) -> None:
+    state["theme_name"] = theme_name if theme_name in THEMES else "default"
+    if not state.get("colors_supported"):
+        state["colors_enabled"] = False
+        state["colors_warning"] = "Colors unsupported"
+    else:
+        state["colors_enabled"] = bool(enabled)
+        state["colors_warning"] = ""
+    setup_theme_colors(state)
 
 
 def env_allows_unicode() -> bool:
@@ -634,7 +879,7 @@ def unicode_supported(stdscr: curses.window) -> bool:
 
 
 def apply_box_mode(state: dict, desired: str) -> None:
-    # Toggle is applied at runtime after Settings Save.
+    # Apply box drawing mode with runtime fallback if Unicode is unsupported.
     if desired == "unicode" and not state.get("unicode_supported"):
         state["box_mode"] = "ascii"
         state["box_warning"] = "Unicode box drawing not supported; using ASCII."
@@ -660,6 +905,8 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     oy = 1 if h >= 3 else 0
     iw = w - (ox * 2)
     ih = h - (oy * 2)
+    dim = bool(state.get("from_list_open") or state.get("help_open"))
+    dim_extra = curses.A_DIM if dim else 0
 
     if iw < 80 or ih < 20:
         safe_addstr(stdscr, 0, 0, "Window too small. Need at least 80x20.")
@@ -667,15 +914,18 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         stdscr.refresh()
         return
 
+    border_attr = role_attr(state, "border", curses.A_BOLD | dim_extra)
     if ox and oy:
-        draw_box(stdscr, 0, 0, h, w, style)
+        draw_box(stdscr, 0, 0, h, w, style, border_attr)
 
-    def add(y: int, x: int, text: str, attr: int = 0) -> None:
+    def add(y: int, x: int, text: str, role: str = "base", extra: int = 0) -> None:
+        attr = role_attr(state, role, extra | dim_extra)
         safe_addstr(stdscr, oy + y, ox + x, text, attr)
 
     def btn(y: int, x: int, key_char: str, label_rest: str, action: str) -> int:
-        cp = CP_BUTTON if state.get("colors") else None
-        width = draw_button(stdscr, oy + y, ox + x, key_char, label_rest, False, True, cp)
+        base_attr = role_attr(state, "button", dim_extra)
+        focus_attr = role_attr(state, "button_focus", dim_extra)
+        width = draw_button(stdscr, oy + y, ox + x, key_char, label_rest, False, True, base_attr, focus_attr)
         add_region(regions, oy + y, ox + x, oy + y, ox + x + width - 1, action)
         return x + width + 1
 
@@ -684,24 +934,37 @@ def render_main(stdscr: curses.window, state: dict) -> None:
             return
         if ox and oy:
             # Use a full-width horizontal line (connects to outer box with h chars).
-            draw_hline(stdscr, oy + y, ox, iw, style["h"])
+            draw_hline(stdscr, oy + y, ox, iw, style["h"], border_attr)
         else:
-            draw_hline(stdscr, y, 0, iw, style["h"])
+            draw_hline(stdscr, y, 0, iw, style["h"], border_attr)
 
-    add(0, 0, "pytzcvrt - dynamic time zone span converter")
+    line = 0
+    add(line, 0, f"pytzcvrt v{__version__} - time zone span converter", "header")
+    line += 1
     mouse_status = "on" if state.get("mouse_enabled") else "off"
-    add(1, 0, f"s=settings  r=reset  q=quit  Tab=next  m=mouse  Mouse: {mouse_status}")
+    header_parts = [
+        f"m=mouse({mouse_status})",
+        "?=help",
+    ]
+    if state.get("box_warning"):
+        header_parts.append(state["box_warning"])
+    if state.get("colors_warning"):
+        header_parts.append(state["colors_warning"])
+    header_lines = wrap_text_lines("  ".join(header_parts), iw)
+    for text in header_lines:
+        add(line, 0, text, "header")
+        line += 1
 
     # Header: show now for current From TZ
     if state["selected"]:
         from_name = state["selected"][state["from_idx"]]
         now_dt = datetime.now(ZoneInfo(from_name))
-        add(2, 0, f"Now ({from_name}): {format_dt_full(now_dt)}")
+        add(line, 0, f"Now ({from_name}): {format_dt_full(now_dt)}", "header")
     else:
-        add(2, 0, "Now: (no selected zones)")
+        add(line, 0, "Now: (no selected zones)", "header")
+    line += 1
 
     # Buttons
-    line = 3
     x = 0
     x = btn(line, x, "R", "eset", "button_reset")
     x = btn(line, x, "S", "ettings", "button_settings")
@@ -710,7 +973,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     # Span input
     draw_inner_hline(line + 1)
     line = line + 2
-    add(line, 0, "Span input:")
+    add(line, 0, "Span input:", "header")
     line += 1
 
     cursor_pos = None
@@ -730,8 +993,8 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     x += len(up_label) + 1
 
     value_text = (from_label + " " * from_width)[:from_width]
-    value_attr = curses.A_REVERSE if state["focus_main"] == 0 else 0
-    add(line, x, f"[{value_text}]", value_attr)
+    value_role = "focus" if state["focus_main"] == 0 else "field"
+    add(line, x, f"[{value_text}]", value_role)
     add_region(regions, oy + line, ox + x, oy + line, ox + x + from_width + 1, "from_toggle")
     from_value_start = x + 1
     x += from_width + 3
@@ -749,6 +1012,8 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     start_field_end = start_value_end + 1
     start_value_start_abs = ox + start_value_start
     start_value_end_abs = ox + start_value_end
+    field_attr = role_attr(state, "field", dim_extra)
+    cursor_attr = role_attr(state, "focus", dim_extra)
     x, cur = draw_field(
         stdscr,
         oy + line,
@@ -758,6 +1023,9 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         INPUT_LEN,
         state["focus_main"] == 1,
         state["cursor_start"],
+        role_attr(state, "base", dim_extra),
+        field_attr,
+        cursor_attr,
     )
     x -= ox
     add_region(
@@ -790,6 +1058,9 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         INPUT_LEN,
         state["focus_main"] == 2,
         state["cursor_end"],
+        role_attr(state, "base", dim_extra),
+        field_attr,
+        cursor_attr,
     )
     x -= ox
     add_region(
@@ -812,14 +1083,14 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     # Results panel
     draw_inner_hline(line + 1)
     line += 2
-    add(line, 0, "Results (PgUp/PgDn or mouse wheel to scroll):")
+    add(line, 0, "Results (click cells to set fields; PgUp/PgDn or mouse wheel to scroll):", "header")
     line += 1
 
     if state["error"]:
-        add(line, 0, f"Error: {state['error']}")
+        add(line, 0, f"Error: {state['error']}", "error")
         line += 1
     else:
-        add(line, 0, f"Duration: {state['duration_str']} ({state['total_minutes']} minutes)")
+        add(line, 0, f"Duration: {state['duration_str']} ({state['total_minutes']} minutes)", "base")
         line += 1
 
     min_dt = 19
@@ -858,7 +1129,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
             pos = sx - table_left
             if 0 < pos < table_w - 1:
                 line_chars[pos] = inter_ch
-        add(y, table_left, "".join(line_chars))
+        add(y, table_left, "".join(line_chars), "border", curses.A_BOLD)
 
     vch = style["v"]
     header_row = (
@@ -869,7 +1140,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     )
 
     draw_table_hline(table_top, style["tl"], style["tr"], style["tee_u"])
-    add(table_top + 1, table_left, header_row)
+    add(table_top + 1, table_left, header_row, "header")
     draw_table_hline(table_top + 2, style["tee_l"], style["tee_r"], style["cross"])
 
     row_start = table_top + 3
@@ -913,6 +1184,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     }
 
     # Draw dropdown overlay after results for true overlay
+    dropdown_win = None
     if dropdown_info:
         style = state.get("box_style", BOX_STYLES["ascii"])
         dropdown_x, dropdown_y = dropdown_info
@@ -935,22 +1207,45 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         box_h = (end - start) + 2
         box_x = ox + max(0, dropdown_x - 1)
         box_y = oy + dropdown_y
-        draw_box(stdscr, box_y, box_x, box_h, box_w, style)
-        for i in range(start, end):
-            label = state["selected"][i]
-            item_y = box_y + 1 + (i - start)
-            item_text = f" {label.ljust(max_len)} "
-            attr = curses.A_REVERSE if i == state["from_list_idx"] else 0
-            safe_addstr(stdscr, item_y, box_x + 1, item_text, attr)
-            add_region(
-                regions,
-                item_y,
-                box_x + 1,
-                item_y,
-                box_x + 1 + len(item_text) - 1,
-                "from_select",
-                i,
-            )
+
+        # Clamp dropdown window to screen bounds
+        box_w = min(box_w, w - box_x)
+        box_h = min(box_h, h - box_y)
+        if box_w >= 2 and box_h >= 2:
+            dropdown_win = curses.newwin(box_h, box_w, box_y, box_x)
+            bg_attr = role_attr(state, "dropdown_bg")
+            dropdown_win.bkgd(" ", bg_attr)
+            dropdown_win.erase()
+            border_attr = role_attr(state, "border", curses.A_BOLD)
+            draw_box(dropdown_win, 0, 0, box_h, box_w, style, border_attr)
+
+            for i in range(start, end):
+                label = state["selected"][i]
+                item_y = 1 + (i - start)
+                if item_y >= box_h - 1:
+                    break
+                item_text = f" {label.ljust(max_len)} "
+                item_text = item_text[: max(0, box_w - 2)]
+                if i == state["from_list_idx"]:
+                    attr = role_attr(state, "dropdown_sel", curses.A_BOLD)
+                else:
+                    attr = role_attr(state, "dropdown_bg")
+                try:
+                    dropdown_win.addstr(item_y, 1, item_text, attr)
+                except curses.error:
+                    pass
+                add_region(
+                    regions,
+                    box_y + item_y,
+                    box_x + 1,
+                    box_y + item_y,
+                    box_x + 1 + len(item_text) - 1,
+                    "from_select",
+                    i,
+                )
+
+    if state.get("help_open"):
+        cursor_pos = None
 
     if cursor_pos:
         try:
@@ -964,7 +1259,70 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         except curses.error:
             pass
 
-    stdscr.refresh()
+    help_win = None
+    if state.get("help_open"):
+        help_win = render_help_overlay(stdscr, state)
+
+    if dropdown_win or help_win:
+        stdscr.noutrefresh()
+        if dropdown_win:
+            dropdown_win.noutrefresh()
+        if help_win:
+            help_win.noutrefresh()
+        curses.doupdate()
+    else:
+        stdscr.refresh()
+
+
+def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | None:
+    h, w = stdscr.getmaxyx()
+    style = state.get("box_style", BOX_STYLES["ascii"])
+
+    lines = [
+        "Help",
+        "",
+        "Main keys:",
+        "  s: settings   r: reset   q: quit   m: mouse on/off",
+        "  Tab/Shift-Tab: move between From TZ, Start, End",
+        "  Up/Down: change From TZ (dropdown closed)",
+        "  Enter: open From TZ dropdown or move to next field",
+        "  ?: toggle this help",
+        "",
+        "Mouse:",
+        "  Click fields or buttons; wheel scrolls results",
+        "  Click results cells: Zone sets From TZ; Start/End/Now sets fields",
+        "",
+        "Settings keys:",
+        "  Tab/Shift-Tab: focus filter/all/selected panes",
+        "  a/Enter: add    d/Delete: remove    u/j: reorder",
+        "  v: view flat/country   o: sort (flat view only)",
+        "  c: colors on/off   t: theme   b: box drawing",
+        "  s: save   q/Esc: cancel",
+        "",
+        "Country view: aliases inferred from zoneinfo links; unmapped in Other/Unmapped (ZZ).",
+        "",
+        "Press ? or Esc to close.",
+    ]
+
+    max_len = max((len(line) for line in lines), default=10)
+    box_w = min(w - 4, max_len + 4)
+    box_h = min(h - 4, len(lines) + 4)
+    if box_w < 10 or box_h < 6:
+        return None
+    box_y = max(0, (h - box_h) // 2)
+    box_x = max(0, (w - box_w) // 2)
+
+    win = curses.newwin(box_h, box_w, box_y, box_x)
+    bg_attr = role_attr(state, "dropdown_bg")
+    win.bkgd(" ", bg_attr)
+    win.erase()
+    border_attr = role_attr(state, "border", curses.A_BOLD)
+    draw_box(win, 0, 0, box_h, box_w, style, border_attr)
+
+    for i, line in enumerate(lines[: box_h - 2]):
+        attr = role_attr(state, "header", curses.A_BOLD) if i == 0 else role_attr(state, "base")
+        safe_addstr(win, 1 + i, 2, line[: max(0, box_w - 4)], attr)
+    return win
 
 
 # -----------------------------
@@ -988,30 +1346,47 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
     oy = 1 if h >= 3 else 0
     iw = w - (ox * 2)
     ih = h - (oy * 2)
+    dim = bool(state.get("help_open"))
+    dim_extra = curses.A_DIM if dim else 0
+    border_attr = role_attr(state, "border", curses.A_BOLD | dim_extra)
     if ox and oy:
-        draw_box(stdscr, 0, 0, h, w, style)
+        draw_box(stdscr, 0, 0, h, w, style, border_attr)
 
-    def add(y: int, x: int, text: str, attr: int = 0) -> None:
+    def add(y: int, x: int, text: str, role: str = "base", extra: int = 0) -> None:
+        attr = role_attr(state, role, extra | dim_extra)
         safe_addstr(stdscr, oy + y, ox + x, text, attr)
 
     def btn(y: int, x: int, key_char: str, label_rest: str, action: str) -> int:
-        cp = CP_BUTTON if state.get("colors") else None
-        width = draw_button(stdscr, oy + y, ox + x, key_char, label_rest, False, True, cp)
+        base_attr = role_attr(state, "button")
+        focus_attr = role_attr(state, "button_focus")
+        width = draw_button(stdscr, oy + y, ox + x, key_char, label_rest, False, True, base_attr, focus_attr)
         add_region(regions, oy + y, ox + x, oy + y, ox + x + width - 1, action)
         return x + width + 1
 
-    add(0, 0, "Settings (s=save, c=cancel, q=cancel, Tab=focus, o=sort, v=view, b=box)")
+    line = 0
+    settings_header = (
+        "Settings (s=save, q=cancel, c=colors, t=theme, Tab=focus, o=sort, v=view, "
+        "b=box, m=mouse, ?=help, click/scroll)"
+    )
+    for text in wrap_text_lines(settings_header, iw):
+        add(line, 0, text, "header")
+        line += 1
+    alias_line = "Country view includes aliases inferred from zoneinfo links; unmapped zones go to Other/Unmapped (ZZ)."
+    for text in wrap_text_lines(alias_line, iw):
+        add(line, 0, text, "base")
+        line += 1
 
     # Filter line
+    filter_y = line
     filter_label = "Filter: "
-    add(2, 0, filter_label)
+    add(filter_y, 0, filter_label, "base")
     fx = len(filter_label)
     filter_text = state["filter_text"]
-    add(2, fx, f"[{filter_text}]")
-    add_region(regions, oy + 2, ox + fx, oy + 2, ox + fx + len(filter_text) + 1, "settings_filter")
+    add(filter_y, fx, f"[{filter_text}]", "field")
+    add_region(regions, oy + filter_y, ox + fx, oy + filter_y, ox + fx + len(filter_text) + 1, "settings_filter")
 
     # Panes
-    list_y = 4
+    list_y = filter_y + 2
     list_h = ih - list_y - 4
     list_h = max(3, list_h)
     gap = 3
@@ -1023,8 +1398,8 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
     # Headings
     left_title = "All time zones"
     right_title = "Selected time zones"
-    add(list_y - 1, left_x, left_title)
-    add(list_y - 1, right_x, right_title)
+    add(list_y - 1, left_x, left_title, "header")
+    add(list_y - 1, right_x, right_title, "header")
 
     # Build lists based on view mode
     view_mode = state["view_mode"]
@@ -1058,11 +1433,22 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
 
     # Scroll calculations
     if view_mode == 0:
-        state["all_scroll"] = ensure_visible(state["all_idx"], state["all_scroll"], list_h, len(all_list))
+        total = len(all_list)
+        if state.get("all_scroll_manual"):
+            state["all_scroll"] = clamp_scroll(state["all_scroll"], list_h, total)
+        else:
+            state["all_scroll"] = ensure_visible(state["all_idx"], state["all_scroll"], list_h, total)
     else:
-        state["all_scroll"] = ensure_visible(state["all_idx"], state["all_scroll"], list_h, len(rows))
+        total = len(rows)
+        if state.get("all_scroll_manual"):
+            state["all_scroll"] = clamp_scroll(state["all_scroll"], list_h, total)
+        else:
+            state["all_scroll"] = ensure_visible(state["all_idx"], state["all_scroll"], list_h, total)
 
-    state["sel_scroll"] = ensure_visible(state["sel_idx"], state["sel_scroll"], list_h, len(selected_list))
+    if state.get("sel_scroll_manual"):
+        state["sel_scroll"] = clamp_scroll(state["sel_scroll"], list_h, len(selected_list))
+    else:
+        state["sel_scroll"] = ensure_visible(state["sel_idx"], state["sel_scroll"], list_h, len(selected_list))
 
     # Draw All list
     for i in range(list_h):
@@ -1072,22 +1458,23 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
             if idx >= len(all_list):
                 break
             name = all_list[idx]
-            attr = 0
             if state["settings_focus"] == 1 and idx == state["all_idx"]:
-                attr = curses.A_REVERSE
-            add(y, left_x, name[: left_w - 1], attr)
+                attr = role_attr(state, "focus")
+            else:
+                attr = role_attr(state, "base")
+            safe_addstr(stdscr, oy + y, ox + left_x, name[: left_w - 1], attr)
         else:
             if idx >= len(rows):
                 break
             row = rows[idx]
-            attr = 0
             if row.kind == "header":
-                attr |= curses.A_BOLD
-                if state.get("colors"):
-                    attr |= curses.color_pair(CP_HEADER)
-            if state["settings_focus"] == 1 and idx == state["all_idx"] and row.kind == "tz":
-                attr = curses.A_REVERSE
-            add(y, left_x, row.label[: left_w - 1], attr)
+                attr = role_attr(state, "header", curses.A_BOLD)
+            else:
+                if state["settings_focus"] == 1 and idx == state["all_idx"]:
+                    attr = role_attr(state, "focus")
+                else:
+                    attr = role_attr(state, "base")
+            safe_addstr(stdscr, oy + y, ox + left_x, row.label[: left_w - 1], attr)
 
     # Draw Selected list
     for i in range(list_h):
@@ -1096,21 +1483,22 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
         if idx >= len(selected_list):
             break
         name = selected_list[idx]
-        attr = 0
         if state["settings_focus"] == 2 and idx == state["sel_idx"]:
-            attr = curses.A_REVERSE
-        add(y, right_x, name[: right_w - 1], attr)
+            attr = role_attr(state, "focus")
+        else:
+            attr = role_attr(state, "base")
+        safe_addstr(stdscr, oy + y, ox + right_x, name[: right_w - 1], attr)
 
     # Vertical separator between panes
     if gap >= 2:
         sep_x = left_x + left_w + (gap // 2)
-        draw_vline(stdscr, oy + list_y - 1, ox + sep_x, list_h + 1, style["v"])
+        draw_vline(stdscr, oy + list_y - 1, ox + sep_x, list_h + 1, style["v"], border_attr)
 
     # Store pane boxes for mouse hit-testing
     state["settings_boxes"] = {
         "all": (oy + list_y, ox + left_x, list_h, left_w),
         "selected": (oy + list_y, ox + right_x, list_h, right_w),
-        "filter": (oy + 2, ox + fx, 1, max(1, iw - fx)),
+        "filter": (oy + filter_y, ox + fx, 1, max(1, iw - fx)),
     }
 
     # Buttons
@@ -1119,15 +1507,25 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
     x = btn(btn_y, x, "A", "dd", "settings_add")
     x = btn(btn_y, x, "D", "elete", "settings_remove")
     x = btn(btn_y, x, "S", "ave", "settings_save")
-    x = btn(btn_y, x, "C", "ancel", "settings_cancel")
+    x = btn(btn_y, x, "Q", "ancel", "settings_cancel")
     box_label = f"ox:{state.get('settings_box_mode', 'ascii').upper()}"
     x = btn(btn_y, x, "B", box_label, "settings_box")
+    colors_label = "olors:On" if state.get("settings_colors_enabled") else "olors:Off"
+    x = btn(btn_y, x, "C", colors_label, "settings_colors")
+    theme_label = f"heme:{state.get('settings_theme', 'default')}"
+    x = btn(btn_y, x, "T", theme_label, "settings_theme")
 
     # Status line
     status_parts = [f"View: {VIEW_MODES[state['view_mode']]}"]
     if state["view_mode"] == 0:
         status_parts.append(f"Sort: {SORT_MODES[state['sort_mode']]}")
     status_parts.append(f"Box: {state.get('settings_box_mode', state['box_mode']).upper()}")
+    if not state.get("colors_supported"):
+        status_parts.append("Colors: unsupported")
+    else:
+        colors_on = "on" if state.get("settings_colors_enabled") else "off"
+        status_parts.append(f"Colors: {colors_on}")
+    status_parts.append(f"Theme: {state.get('settings_theme', state.get('theme_name', 'default'))}")
     if state.get("country_error"):
         status_parts.append(f"Error: {state['country_error']}")
     box_warn = state.get("box_warning")
@@ -1135,13 +1533,26 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
         box_warn = "Unicode box drawing not supported; using ASCII."
     if box_warn:
         status_parts.append(box_warn)
+    if state.get("colors_warning"):
+        status_parts.append(state["colors_warning"])
+    if view_mode == 1 and rows:
+        idx = state["all_idx"]
+        if 0 <= idx < len(rows):
+            row = rows[idx]
+            if row.kind == "tz" and row.is_alias and row.alias_target:
+                status_parts.append(f"Alias of {row.alias_target}")
     if state.get("settings_msg"):
         status_parts.append(state["settings_msg"])
     status = " | ".join(status_parts)
     add(ih - 1, 0, status)
 
     # Cursor for filter
-    if state["settings_focus"] == 0:
+    if state.get("help_open"):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+    elif state["settings_focus"] == 0:
         try:
             curses.curs_set(1)
         except curses.error:
@@ -1154,7 +1565,16 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
         except curses.error:
             pass
 
-    stdscr.refresh()
+    help_win = None
+    if state.get("help_open"):
+        help_win = render_help_overlay(stdscr, state)
+
+    if help_win:
+        stdscr.noutrefresh()
+        help_win.noutrefresh()
+        curses.doupdate()
+    else:
+        stdscr.refresh()
 
 
 # -----------------------------
@@ -1180,7 +1600,7 @@ def settings_add(state: dict) -> None:
                 state["settings_msg"] = "Select a time zone row."
                 return
             state["all_idx"] = idx
-        name = rows[idx].tz_name or ""
+        name = rows[idx].tz_id or ""
 
     if not name:
         state["settings_msg"] = "Select a time zone row."
@@ -1233,7 +1653,15 @@ def open_settings(state: dict) -> None:
     state["settings_selected"] = list(state["selected"])
     state["settings_original"] = list(state["selected"])
     state["settings_box_mode"] = state.get("box_mode", "ascii")
+    state["settings_colors_enabled"] = state.get("colors_enabled", False)
+    state["settings_theme"] = state.get("theme_name", "default")
+    state["settings_original_box_mode"] = state.get("box_mode", "ascii")
+    state["settings_original_colors"] = state.get("colors_enabled", False)
+    state["settings_original_theme"] = state.get("theme_name", "default")
     state["settings_focus"] = 1
+    state["help_open"] = False
+    state["all_scroll_manual"] = False
+    state["sel_scroll_manual"] = False
     state["filter_text"] = ""
     state["filter_cursor"] = 0
     state["all_idx"] = 0
@@ -1250,7 +1678,12 @@ def save_settings(state: dict) -> bool:
     state["selected"] = list(state["settings_selected"])
     state["from_idx"] = min(state["from_idx"], len(state["selected"]) - 1)
     apply_box_mode(state, state.get("settings_box_mode", state["box_mode"]))
-    save_config(state["selected"], state["box_mode"])
+    apply_color_settings(
+        state,
+        bool(state.get("settings_colors_enabled")),
+        state.get("settings_theme", state.get("theme_name", "default")),
+    )
+    save_config(state["selected"], state["box_mode"], state.get("colors_enabled", False), state.get("theme_name", "default"))
     state["settings_open"] = False
     state["from_list_open"] = False
     compute_results(state)
@@ -1260,6 +1693,12 @@ def save_settings(state: dict) -> bool:
 def cancel_settings(state: dict) -> None:
     state["settings_open"] = False
     state["settings_selected"] = list(state["settings_original"])
+    apply_box_mode(state, state.get("settings_original_box_mode", state.get("box_mode", "ascii")))
+    apply_color_settings(
+        state,
+        bool(state.get("settings_original_colors", state.get("colors_enabled", False))),
+        state.get("settings_original_theme", state.get("theme_name", "default")),
+    )
     state["settings_msg"] = ""
 
 
@@ -1284,9 +1723,21 @@ def handle_main_input(key: int, state: dict) -> bool:
     if key == -1:
         return False
 
+    if state.get("help_open"):
+        if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
+            state["help_open"] = False
+            return True
+        return False
+
     if key in (ord("q"), ord("Q")):
         state["quit"] = True
         return False
+
+    if key == ord("?"):
+        state["help_open"] = not state.get("help_open")
+        if state["help_open"]:
+            state["from_list_open"] = False
+        return True
 
     if key in (ord("s"), ord("S")):
         open_settings(state)
@@ -1327,6 +1778,9 @@ def handle_main_input(key: int, state: dict) -> bool:
                 return True
             if key == curses.KEY_DOWN:
                 state["from_list_idx"] = min(len(state["selected"]) - 1, state["from_list_idx"] + 1)
+                return True
+            if key == 27:  # Esc
+                state["from_list_open"] = False
                 return True
             if key in (curses.KEY_ENTER, 10, 13):
                 state["from_idx"] = state["from_list_idx"]
@@ -1426,6 +1880,12 @@ def handle_main_input(key: int, state: dict) -> bool:
 # -----------------------------
 
 def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
+    if state.get("help_open"):
+        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
+            state["help_open"] = False
+            return True
+        return False
+
     if bstate & curses.BUTTON4_PRESSED:
         state["results_scroll"] -= 3
         return True
@@ -1549,6 +2009,12 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
 
 
 def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
+    if state.get("help_open"):
+        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
+            state["help_open"] = False
+            return True
+        return False
+
     boxes = state.get("settings_boxes", {})
     all_box = boxes.get("all")
     sel_box = boxes.get("selected")
@@ -1557,22 +2023,36 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
     if bstate & curses.BUTTON4_PRESSED:
         if all_box and all_box[0] <= my < all_box[0] + all_box[2] and all_box[1] <= mx < all_box[1] + all_box[3]:
             state["settings_focus"] = 1
-            state["all_scroll"] -= 1
+            state["all_scroll_manual"] = True
+            if state["view_mode"] == 0:
+                total = len(get_all_list(state))
+            else:
+                total = len(build_country_rows(state["country_map"], state["filter_text"]))
+            state["all_scroll"] = clamp_scroll(state["all_scroll"] - 1, all_box[2], total)
             return True
         if sel_box and sel_box[0] <= my < sel_box[0] + sel_box[2] and sel_box[1] <= mx < sel_box[1] + sel_box[3]:
             state["settings_focus"] = 2
-            state["sel_scroll"] -= 1
+            state["sel_scroll_manual"] = True
+            total = len(state["settings_selected"])
+            state["sel_scroll"] = clamp_scroll(state["sel_scroll"] - 1, sel_box[2], total)
             return True
         return False
 
     if bstate & curses.BUTTON5_PRESSED:
         if all_box and all_box[0] <= my < all_box[0] + all_box[2] and all_box[1] <= mx < all_box[1] + all_box[3]:
             state["settings_focus"] = 1
-            state["all_scroll"] += 1
+            state["all_scroll_manual"] = True
+            if state["view_mode"] == 0:
+                total = len(get_all_list(state))
+            else:
+                total = len(build_country_rows(state["country_map"], state["filter_text"]))
+            state["all_scroll"] = clamp_scroll(state["all_scroll"] + 1, all_box[2], total)
             return True
         if sel_box and sel_box[0] <= my < sel_box[0] + sel_box[2] and sel_box[1] <= mx < sel_box[1] + sel_box[3]:
             state["settings_focus"] = 2
-            state["sel_scroll"] += 1
+            state["sel_scroll_manual"] = True
+            total = len(state["settings_selected"])
+            state["sel_scroll"] = clamp_scroll(state["sel_scroll"] + 1, sel_box[2], total)
             return True
         return False
 
@@ -1596,10 +2076,37 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
         if action == "settings_box":
             current = state.get("settings_box_mode", "ascii")
             state["settings_box_mode"] = "unicode" if current == "ascii" else "ascii"
+            apply_box_mode(state, state["settings_box_mode"])
+            return True
+        if action == "settings_colors":
+            if not state.get("colors_supported"):
+                state["settings_msg"] = "Colors unsupported."
+                state["settings_colors_enabled"] = False
+            else:
+                state["settings_colors_enabled"] = not state.get("settings_colors_enabled")
+            apply_color_settings(
+                state,
+                bool(state.get("settings_colors_enabled")),
+                state.get("settings_theme", state.get("theme_name", "default")),
+            )
+            return True
+        if action == "settings_theme":
+            current = state.get("settings_theme", "default")
+            if current in THEME_NAMES:
+                idx = (THEME_NAMES.index(current) + 1) % len(THEME_NAMES)
+                state["settings_theme"] = THEME_NAMES[idx]
+            else:
+                state["settings_theme"] = THEME_NAMES[0]
+            apply_color_settings(
+                state,
+                bool(state.get("settings_colors_enabled")),
+                state.get("settings_theme", state.get("theme_name", "default")),
+            )
             return True
         if action == "settings_filter":
             state["settings_focus"] = 0
             state["filter_cursor"] = len(state["filter_text"])
+            state["all_scroll_manual"] = False
             return True
 
     # Click inside panes
@@ -1610,6 +2117,7 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
             all_list = get_all_list(state)
             if 0 <= idx < len(all_list):
                 state["all_idx"] = idx
+                state["all_scroll_manual"] = False
         else:
             rows = build_country_rows(state["country_map"], state["filter_text"])
             if 0 <= idx < len(rows):
@@ -1617,6 +2125,7 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
                     state["all_idx"] = next_selectable_index(rows, idx, 1)
                 else:
                     state["all_idx"] = idx
+                state["all_scroll_manual"] = False
         return True
 
     if sel_box and sel_box[0] <= my < sel_box[0] + sel_box[2] and sel_box[1] <= mx < sel_box[1] + sel_box[3]:
@@ -1624,11 +2133,13 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
         idx = state["sel_scroll"] + (my - sel_box[0])
         if 0 <= idx < len(state["settings_selected"]):
             state["sel_idx"] = idx
+            state["sel_scroll_manual"] = False
         return True
 
     if filter_box and filter_box[0] <= my < filter_box[0] + filter_box[2]:
         state["settings_focus"] = 0
         state["filter_cursor"] = len(state["filter_text"])
+        state["all_scroll_manual"] = False
         return True
 
     return False
@@ -1641,6 +2152,16 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
 def handle_settings_input(key: int, state: dict) -> bool:
     if key == -1:
         return False
+
+    if state.get("help_open"):
+        if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
+            state["help_open"] = False
+            return True
+        return False
+
+    if key == ord("?"):
+        state["help_open"] = True
+        return True
 
     if key == 9:  # Tab
         state["settings_focus"] = (state["settings_focus"] + 1) % 3
@@ -1656,11 +2177,16 @@ def handle_settings_input(key: int, state: dict) -> bool:
 
     if state["settings_focus"] == 0:
         # Filter input
+        if key in (curses.KEY_ENTER, 10, 13):
+            state["settings_focus"] = (state["settings_focus"] + 1) % 3
+            return True
         if key in (curses.KEY_BACKSPACE, 127, 8):
             if state["filter_cursor"] > 0:
                 i = state["filter_cursor"]
                 state["filter_text"] = state["filter_text"][: i - 1] + state["filter_text"][i:]
                 state["filter_cursor"] -= 1
+                state["all_scroll_manual"] = False
+                state["all_scroll"] = 0
             return True
         if key in (curses.KEY_LEFT,):
             state["filter_cursor"] = max(0, state["filter_cursor"] - 1)
@@ -1675,14 +2201,11 @@ def handle_settings_input(key: int, state: dict) -> bool:
             state["filter_cursor"] += 1
             state["all_idx"] = 0
             state["all_scroll"] = 0
+            state["all_scroll_manual"] = False
             return True
         return False
 
     if key in (ord("q"), ord("Q")):
-        cancel_settings(state)
-        return True
-
-    if key in (ord("c"), ord("C")):
         cancel_settings(state)
         return True
 
@@ -1696,6 +2219,34 @@ def handle_settings_input(key: int, state: dict) -> bool:
     if key in (ord("b"), ord("B")):
         current = state.get("settings_box_mode", "ascii")
         state["settings_box_mode"] = "unicode" if current == "ascii" else "ascii"
+        apply_box_mode(state, state["settings_box_mode"])
+        return True
+
+    if key in (ord("c"), ord("C")):
+        if not state.get("colors_supported"):
+            state["settings_msg"] = "Colors unsupported."
+            state["settings_colors_enabled"] = False
+        else:
+            state["settings_colors_enabled"] = not state.get("settings_colors_enabled")
+        apply_color_settings(
+            state,
+            bool(state.get("settings_colors_enabled")),
+            state.get("settings_theme", state.get("theme_name", "default")),
+        )
+        return True
+
+    if key in (ord("t"), ord("T")):
+        current = state.get("settings_theme", "default")
+        if current in THEME_NAMES:
+            idx = (THEME_NAMES.index(current) + 1) % len(THEME_NAMES)
+            state["settings_theme"] = THEME_NAMES[idx]
+        else:
+            state["settings_theme"] = THEME_NAMES[0]
+        apply_color_settings(
+            state,
+            bool(state.get("settings_colors_enabled")),
+            state.get("settings_theme", state.get("theme_name", "default")),
+        )
         return True
 
     if key in (ord("v"), ord("V")):
@@ -1705,11 +2256,13 @@ def handle_settings_input(key: int, state: dict) -> bool:
         state["view_mode"] = (state["view_mode"] + 1) % len(VIEW_MODES)
         state["all_idx"] = 0
         state["all_scroll"] = 0
+        state["all_scroll_manual"] = False
         return True
 
     if key in (ord("o"), ord("O")):
         if state["view_mode"] == 0:
             state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
+            state["all_scroll_manual"] = False
         else:
             state["settings_msg"] = "Sort modes only in flat view."
         return True
@@ -1720,15 +2273,33 @@ def handle_settings_input(key: int, state: dict) -> bool:
             all_list = get_all_list(state)
             if key in (curses.KEY_UP,):
                 state["all_idx"] = max(0, state["all_idx"] - 1)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_DOWN,):
                 state["all_idx"] = min(len(all_list) - 1, state["all_idx"] + 1)
+                state["all_scroll_manual"] = False
+                return True
+            if key in (curses.KEY_HOME,):
+                if all_list:
+                    state["all_idx"] = 0
+                state["all_scroll_manual"] = False
+                return True
+            if key in (curses.KEY_END,):
+                if all_list:
+                    state["all_idx"] = len(all_list) - 1
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_NPAGE,):
-                state["all_scroll"] += 3
+                page = max(1, state["settings_boxes"]["all"][2] - 1)
+                if all_list:
+                    state["all_idx"] = min(len(all_list) - 1, state["all_idx"] + page)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_PPAGE,):
-                state["all_scroll"] -= 3
+                page = max(1, state["settings_boxes"]["all"][2] - 1)
+                if all_list:
+                    state["all_idx"] = max(0, state["all_idx"] - page)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_ENTER, 10, 13, ord("a"), ord("A")):
                 settings_add(state)
@@ -1740,17 +2311,31 @@ def handle_settings_input(key: int, state: dict) -> bool:
                 return False
             if key in (curses.KEY_UP,):
                 state["all_idx"] = next_selectable_index(rows, state["all_idx"] - 1, -1)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_DOWN,):
                 state["all_idx"] = next_selectable_index(rows, state["all_idx"] + 1, 1)
+                state["all_scroll_manual"] = False
+                return True
+            if key in (curses.KEY_HOME,):
+                state["all_idx"] = next_selectable_index(rows, 0, 1)
+                state["all_scroll_manual"] = False
+                return True
+            if key in (curses.KEY_END,):
+                state["all_idx"] = next_selectable_index(rows, len(rows) - 1, -1)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_NPAGE,):
-                target = state["all_idx"] + (state["settings_boxes"]["all"][2] - 1)
+                page = max(1, state["settings_boxes"]["all"][2] - 1)
+                target = state["all_idx"] + page
                 state["all_idx"] = next_selectable_index(rows, target, 1)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_PPAGE,):
-                target = state["all_idx"] - (state["settings_boxes"]["all"][2] - 1)
+                page = max(1, state["settings_boxes"]["all"][2] - 1)
+                target = state["all_idx"] - page
                 state["all_idx"] = next_selectable_index(rows, target, -1)
+                state["all_scroll_manual"] = False
                 return True
             if key in (curses.KEY_ENTER, 10, 13, ord("a"), ord("A")):
                 settings_add(state)
@@ -1760,15 +2345,33 @@ def handle_settings_input(key: int, state: dict) -> bool:
         # Selected list
         if key in (curses.KEY_UP,):
             state["sel_idx"] = max(0, state["sel_idx"] - 1)
+            state["sel_scroll_manual"] = False
             return True
         if key in (curses.KEY_DOWN,):
             state["sel_idx"] = min(len(state["settings_selected"]) - 1, state["sel_idx"] + 1)
+            state["sel_scroll_manual"] = False
+            return True
+        if key in (curses.KEY_HOME,):
+            if state["settings_selected"]:
+                state["sel_idx"] = 0
+            state["sel_scroll_manual"] = False
+            return True
+        if key in (curses.KEY_END,):
+            if state["settings_selected"]:
+                state["sel_idx"] = len(state["settings_selected"]) - 1
+            state["sel_scroll_manual"] = False
             return True
         if key in (curses.KEY_NPAGE,):
-            state["sel_scroll"] += 3
+            page = max(1, state["settings_boxes"]["selected"][2] - 1)
+            if state["settings_selected"]:
+                state["sel_idx"] = min(len(state["settings_selected"]) - 1, state["sel_idx"] + page)
+            state["sel_scroll_manual"] = False
             return True
         if key in (curses.KEY_PPAGE,):
-            state["sel_scroll"] -= 3
+            page = max(1, state["settings_boxes"]["selected"][2] - 1)
+            if state["settings_selected"]:
+                state["sel_idx"] = max(0, state["sel_idx"] - page)
+            state["sel_scroll_manual"] = False
             return True
         if key in (ord("d"), ord("D"), curses.KEY_DC):
             settings_remove(state)
@@ -1787,12 +2390,16 @@ def handle_settings_input(key: int, state: dict) -> bool:
 # Main loop
 # -----------------------------
 
-def main(stdscr: curses.window) -> None:
+def main(stdscr: curses.window, args: argparse.Namespace) -> None:
     stdscr.timeout(200)
     stdscr.keypad(True)
+    try:
+        curses.set_escdelay(25)
+    except Exception:
+        pass
 
     all_zones_set = set(available_timezones())
-    selected, box_mode = load_config(all_zones_set)
+    selected, box_mode, colors_pref, theme_name = load_config(all_zones_set)
 
     country_map, country_err = load_country_timezones(all_zones_set)
 
@@ -1818,6 +2425,7 @@ def main(stdscr: curses.window) -> None:
         "duration_str": "",
         "total_minutes": 0,
         "quit": False,
+        "help_open": False,
         "regions": [],
         "mouse_enabled": False,
         "settings_open": False,
@@ -1828,25 +2436,46 @@ def main(stdscr: curses.window) -> None:
         "filter_cursor": 0,
         "all_idx": 0,
         "all_scroll": 0,
+        "all_scroll_manual": False,
         "sel_idx": 0,
         "sel_scroll": 0,
+        "sel_scroll_manual": False,
         "sort_mode": 0,
         "view_mode": 0,
         "settings_msg": "",
         "settings_boxes": {},
         "country_map": country_map,
         "country_error": country_err,
-        "colors": False,
+        "colors_supported": False,
+        "colors_enabled": False,
+        "colors_warning": "",
+        "theme_name": theme_name,
+        "role_pairs": {},
         "box_mode": "ascii",
         "box_style": BOX_STYLES["ascii"],
         "box_warning": "",
         "unicode_supported": supported_unicode,
         "settings_box_mode": "ascii",
+        "settings_colors_enabled": False,
+        "settings_theme": theme_name,
     }
 
-    init_colors(state)
+    init_color_support(state)
+    if args.no_color:
+        colors_pref = False
+    if colors_pref is None:
+        state["colors_enabled"] = bool(state.get("colors_supported"))
+    else:
+        state["colors_enabled"] = bool(colors_pref)
+
+    if args.ascii:
+        box_mode = "ascii"
+    elif args.unicode:
+        box_mode = "unicode"
+
+    apply_color_settings(state, state["colors_enabled"], theme_name)
     apply_box_mode(state, box_mode)
-    set_mouse_enabled(state, True)
+    set_mouse_enabled(state, not args.no_mouse)
     reset_inputs(state)
     compute_results(state)
 
@@ -1879,14 +2508,37 @@ def main(stdscr: curses.window) -> None:
                 render_main(stdscr, state)
 
 
-def run() -> int:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="pytzcvrt",
+        description=(
+            "Terminal TUI for displaying current time and converting time spans "
+            "across a selected list of time zones."
+        ),
+        epilog="CLI flags override config for this run only; settings are saved only via the TUI.",
+    )
+    parser.add_argument("--config", help="Override config file path for this run.")
+    parser.add_argument("--no-mouse", action="store_true", help="Disable mouse support for this run.")
+    parser.add_argument("--no-color", action="store_true", help="Start with colors disabled.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--ascii", action="store_true", help="Force ASCII box drawing at startup.")
+    group.add_argument("--unicode", action="store_true", help="Request Unicode box drawing at startup.")
+    parser.add_argument("--version", action="version", version=f"pytzcvrt {__version__}")
+    return parser.parse_args(argv)
+
+
+def run(argv: list[str] | None = None) -> int:
     try:
+        args = parse_args(argv)
+        if args.config:
+            global CONFIG_PATH
+            CONFIG_PATH = args.config
         # Enable wide-char support in curses based on the current locale.
         try:
             locale.setlocale(locale.LC_ALL, "")
         except locale.Error:
             pass
-        curses.wrapper(main)
+        curses.wrapper(lambda stdscr: main(stdscr, args))
         return 0
     except KeyboardInterrupt:
         return 0
