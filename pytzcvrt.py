@@ -32,6 +32,7 @@ Limitations:
 
 from __future__ import annotations
 
+
 import argparse
 import curses
 import json
@@ -46,7 +47,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pytzcvrt.json")
-__version__ = "0.9.3"
+__version__ = "0.9.2"
 DEFAULT_SELECTED = [
     "Asia/Baghdad",
     "Europe/Stockholm",
@@ -68,6 +69,7 @@ DIGIT_SET = set(DIGIT_POSITIONS)
 FIRST_DIGIT = DIGIT_POSITIONS[0]
 LAST_DIGIT = DIGIT_POSITIONS[-1]
 TIME_FIRST_DIGIT = INPUT_TEMPLATE.index(" ") + 1
+FLASH_DURATION = 0.5
 
 SORT_MODES = [
     "Name (A-Z)",
@@ -857,6 +859,10 @@ def apply_color_settings(state: dict, enabled: bool, theme_name: str) -> None:
     setup_theme_colors(state)
 
 
+def flash_active(state: dict, key: str, now: float) -> bool:
+    return now < state.get("flash_until", {}).get(key, 0.0)
+
+
 def env_allows_unicode() -> bool:
     enc = (sys.stdout.encoding or "").lower()
     loc = (locale.getpreferredencoding(False) or "").lower()
@@ -898,6 +904,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     regions: list[tuple[int, int, int, int, str, object | None]] = []
     state["regions"] = regions
 
+    now_mono = time.monotonic()
     h, w = stdscr.getmaxyx()
     state["last_size"] = (h, w)
     style = state.get("box_style", BOX_STYLES["ascii"])
@@ -994,7 +1001,9 @@ def render_main(stdscr: curses.window, state: dict) -> None:
 
     value_text = (from_label + " " * from_width)[:from_width]
     value_role = "focus" if state["focus_main"] == 0 else "field"
-    add(line, x, f"[{value_text}]", value_role)
+    flash_extra = curses.A_REVERSE | curses.A_BOLD if flash_active(state, "from", now_mono) else 0
+    value_attr = role_attr(state, value_role, flash_extra | dim_extra)
+    safe_addstr(stdscr, oy + line, ox + x, f"[{value_text}]", value_attr)
     add_region(regions, oy + line, ox + x, oy + line, ox + x + from_width + 1, "from_toggle")
     from_value_start = x + 1
     x += from_width + 3
@@ -1012,6 +1021,10 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     start_field_end = start_value_end + 1
     start_value_start_abs = ox + start_value_start
     start_value_end_abs = ox + start_value_end
+    flash_start = flash_active(state, "start", now_mono)
+    flash_end = flash_active(state, "end", now_mono)
+    flash_attr_start = (curses.A_REVERSE | curses.A_BOLD) if flash_start else 0
+    flash_attr_end = (curses.A_REVERSE | curses.A_BOLD) if flash_end else 0
     field_attr = role_attr(state, "field", dim_extra)
     cursor_attr = role_attr(state, "focus", dim_extra)
     x, cur = draw_field(
@@ -1024,7 +1037,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         state["focus_main"] == 1,
         state["cursor_start"],
         role_attr(state, "base", dim_extra),
-        field_attr,
+        field_attr | flash_attr_start,
         cursor_attr,
     )
     x -= ox
@@ -1059,7 +1072,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         state["focus_main"] == 2,
         state["cursor_end"],
         role_attr(state, "base", dim_extra),
-        field_attr,
+        field_attr | flash_attr_end,
         cursor_attr,
     )
     x -= ox
@@ -1915,6 +1928,8 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
         results = state.get("results") or []
         if not (0 <= row_idx < len(results)):
             return False
+        now_mono = time.monotonic()
+        flash_until = state.setdefault("flash_until", {})
         tz_name, start_dt, end_dt = results[row_idx]
         zone_w = layout["zone_w"]
         dt_w = layout["dt_w"]
@@ -1925,29 +1940,47 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
         end_x = start_x + dt_w + 1
         if zone_x <= mx < zone_x + zone_w:
             if tz_name in state["selected"]:
-                state["from_idx"] = state["selected"].index(tz_name)
+                new_idx = state["selected"].index(tz_name)
+                if new_idx != state["from_idx"]:
+                    flash_until["from"] = now_mono + FLASH_DURATION
+                state["from_idx"] = new_idx
                 state["focus_main"] = 1
                 state["cursor_start"] = TIME_FIRST_DIGIT
                 compute_results(state)
                 return True
         if now_x <= mx < now_x + dt_w:
             if tz_name in state["selected"]:
-                state["from_idx"] = state["selected"].index(tz_name)
-            state["start_text"] = start_dt.strftime(INPUT_FMT)
-            state["end_text"] = end_dt.strftime(INPUT_FMT)
+                new_idx = state["selected"].index(tz_name)
+                if new_idx != state["from_idx"]:
+                    flash_until["from"] = now_mono + FLASH_DURATION
+                state["from_idx"] = new_idx
+            new_start = start_dt.strftime(INPUT_FMT)
+            new_end = end_dt.strftime(INPUT_FMT)
+            if new_start != state["start_text"]:
+                flash_until["start"] = now_mono + FLASH_DURATION
+            if new_end != state["end_text"]:
+                flash_until["end"] = now_mono + FLASH_DURATION
+            state["start_text"] = new_start
+            state["end_text"] = new_end
             state["focus_main"] = 1
             state["cursor_start"] = TIME_FIRST_DIGIT
             state["from_list_open"] = False
             compute_results(state)
             return True
         if start_x <= mx < start_x + dt_w:
-            state["start_text"] = start_dt.strftime(INPUT_FMT)
+            new_start = start_dt.strftime(INPUT_FMT)
+            if new_start != state["start_text"]:
+                flash_until["start"] = now_mono + FLASH_DURATION
+            state["start_text"] = new_start
             state["focus_main"] = 1
             state["cursor_start"] = TIME_FIRST_DIGIT
             compute_results(state)
             return True
         if end_x <= mx < end_x + dt_w:
-            state["end_text"] = end_dt.strftime(INPUT_FMT)
+            new_end = end_dt.strftime(INPUT_FMT)
+            if new_end != state["end_text"]:
+                flash_until["end"] = now_mono + FLASH_DURATION
+            state["end_text"] = new_end
             state["focus_main"] = 2
             state["cursor_end"] = TIME_FIRST_DIGIT
             compute_results(state)
@@ -2425,6 +2458,7 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
         "duration_str": "",
         "total_minutes": 0,
         "quit": False,
+        "flash_until": {},
         "help_open": False,
         "regions": [],
         "mouse_enabled": False,
