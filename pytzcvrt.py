@@ -77,6 +77,14 @@ def format_dt_compact(dt: datetime) -> str:
     return f"{base} {tzname}{off}"
 
 
+def format_dt_local(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def format_dt_local_seconds(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def parse_dt(text: str) -> datetime:
     return datetime.strptime(text.strip(), INPUT_FMT)
 
@@ -331,6 +339,9 @@ def clamp_scroll(scroll: int, height: int, total: int) -> int:
     return max(0, min(scroll, total - height))
 
 
+ 
+
+
 # -----------------------------
 # Settings list helpers
 # -----------------------------
@@ -395,6 +406,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     state["regions"] = regions
 
     h, w = stdscr.getmaxyx()
+    state["last_size"] = (h, w)
     if w < 80 or h < 20:
         safe_addstr(stdscr, 0, 0, "Window too small. Need at least 80x20.")
         safe_addstr(stdscr, 1, 0, f"Current size: {w}x{h}.")
@@ -407,7 +419,7 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         stdscr,
         1,
         0,
-        f"s=settings  r=reset  q=quit  Tab=next  Mouse: {mouse_status}",
+        f"s=settings  r=reset  q=quit  Tab=next  m=mouse  Mouse: {mouse_status}",
     )
 
     # Header: show now for current From TZ
@@ -445,10 +457,10 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     safe_addstr(stdscr, line, x, from_label_text)
     x += len(from_label_text)
 
-    left_text = "[<]"
-    safe_addstr(stdscr, line, x, left_text)
-    add_region(regions, line, x, line, x + len(left_text) - 1, "from_prev")
-    x += len(left_text) + 1
+    up_label = "[^]"
+    safe_addstr(stdscr, line, x, up_label)
+    add_region(regions, line, x, line, x + len(up_label) - 1, "from_prev")
+    x += len(up_label) + 1
 
     value_text = (from_label + " " * from_width)[:from_width]
     value_attr = curses.A_REVERSE if state["focus_main"] == 0 else 0
@@ -458,10 +470,10 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     from_value_end = from_value_start + from_width - 1
     x += from_width + 3
 
-    right_text = "[>]"
-    safe_addstr(stdscr, line, x, right_text)
-    add_region(regions, line, x, line, x + len(right_text) - 1, "from_next")
-    x += len(right_text) + 2
+    down_label = "[v]"
+    safe_addstr(stdscr, line, x, down_label)
+    add_region(regions, line, x, line, x + len(down_label) - 1, "from_next")
+    x += len(down_label) + 2
 
     # Start field
     start_label_text = "Start: "
@@ -542,11 +554,12 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         )
         line += 1
 
-    zone_w = min(20, max(10, w // 4))
-    dt_w = max(22, (w - zone_w - 3) // 2)
-    header = f"{'Zone':<{zone_w}} {'Start':<{dt_w}} {'End':<{dt_w}}"
+    zone_w = min(28, max(12, w // 4))
+    dt_w = max(19, (w - zone_w - 4) // 3)
+    header = f"{'Zone':<{zone_w}} {'Now':<{dt_w}} {'Start':<{dt_w}} {'End':<{dt_w}}"
     safe_addstr(stdscr, line, 0, header)
     line += 1
+    state["results_row_start"] = line
 
     results = state["results"] or []
     available = max(1, h - line - 1)
@@ -559,10 +572,18 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         if line >= h:
             break
         tz_name, start_dt, end_dt = results[idx]
-        start_s = format_dt_compact(start_dt)
-        end_s = format_dt_compact(end_dt)
-        row = f"{tz_name:<{zone_w}} {start_s:<{dt_w}} {end_s:<{dt_w}}"
-        safe_addstr(stdscr, line, 0, row)
+        now_dt = datetime.now(ZoneInfo(tz_name))
+        tz_abbr = now_dt.tzname() or "UTC"
+        tz_off = format_offset(now_dt.utcoffset(), with_colon=False)
+        zone_label = f"{tz_name} {tz_abbr}{tz_off}"
+        now_s = format_dt_local_seconds(now_dt)
+        start_s = format_dt_local(start_dt)
+        end_s = format_dt_local(end_dt)
+
+        safe_addstr(stdscr, line, 0, f"{zone_label:<{zone_w}}")
+        safe_addstr(stdscr, line, zone_w + 1, f"{now_s:<{dt_w}}")
+        safe_addstr(stdscr, line, zone_w + 1 + dt_w + 1, f"{start_s:<{dt_w}}")
+        safe_addstr(stdscr, line, zone_w + 1 + (dt_w + 1) * 2, f"{end_s:<{dt_w}}")
         line += 1
 
     # Draw dropdown overlay after results for true overlay
@@ -846,6 +867,10 @@ def handle_main_input(key: int, state: dict) -> bool:
         compute_results(state)
         return True
 
+    if key in (ord("m"), ord("M")):
+        set_mouse_enabled(state, not state.get("mouse_enabled"))
+        return True
+
     if key == 9:  # Tab
         state["focus_main"] = (state["focus_main"] + 1) % 3
         state["from_list_open"] = False
@@ -865,23 +890,31 @@ def handle_main_input(key: int, state: dict) -> bool:
         return True
 
     # From TZ selection
-    if state["focus_main"] == 0:
-        if key == curses.KEY_UP:
-            if state["selected"]:
+    if state["selected"]:
+        if state.get("from_list_open"):
+            if key == curses.KEY_UP:
+                state["from_list_idx"] = max(0, state["from_list_idx"] - 1)
+                return True
+            if key == curses.KEY_DOWN:
+                state["from_list_idx"] = min(len(state["selected"]) - 1, state["from_list_idx"] + 1)
+                return True
+            if key in (curses.KEY_ENTER, 10, 13):
+                state["from_idx"] = state["from_list_idx"]
+                state["from_list_open"] = False
+                state["focus_main"] = 1
+                state["cursor_start"] = TIME_FIRST_DIGIT
+                compute_results(state)
+                return True
+        else:
+            if key == curses.KEY_UP:
                 state["from_idx"] = (state["from_idx"] - 1) % len(state["selected"])
-                state["focus_main"] = 1
-                state["cursor_start"] = TIME_FIRST_DIGIT
                 compute_results(state)
                 return True
-        if key == curses.KEY_DOWN:
-            if state["selected"]:
+            if key == curses.KEY_DOWN:
                 state["from_idx"] = (state["from_idx"] + 1) % len(state["selected"])
-                state["focus_main"] = 1
-                state["cursor_start"] = TIME_FIRST_DIGIT
                 compute_results(state)
                 return True
-        if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
-            if state["selected"]:
+            if state["focus_main"] == 0 and key in (curses.KEY_ENTER, 10, 13, ord(" ")):
                 state["from_list_open"] = not state["from_list_open"]
                 state["from_list_idx"] = state["from_idx"]
                 return True
@@ -961,10 +994,7 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
         state["results_scroll"] += 3
         return True
 
-    if not (bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED | curses.BUTTON1_RELEASED)):
-        return False
-
-    if not (bstate & curses.BUTTON1_CLICKED):
+    if not (bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)):
         return False
 
     hit = region_hit(state.get("regions", []), mx, my)
@@ -972,6 +1002,46 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
         if state.get("from_list_open"):
             state["from_list_open"] = False
             return True
+        # Click in results pane to set fields
+        if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED):
+            res = state.get("results") or []
+            if res:
+                h, w = state.get("last_size", (0, 0))
+                # Reconstruct layout similar to render_main
+                zone_w = min(28, max(12, w // 4)) if w else 20
+                dt_w = max(19, (w - zone_w - 4) // 3) if w else 19
+                # Compute where results start
+                # Lines: 0 header,1 status,2 now,3 selected,4 buttons,5 blank,6 label,7 fields,8 blank,9 results label,10 duration,11 header
+                # Render uses: results label at line+2 from span input, then duration line, then header.
+                row_start = state.get("results_row_start", None)
+                if row_start is None:
+                    row_start = 12
+                row_idx = (my - row_start) + state.get("results_scroll", 0)
+                if 0 <= row_idx < len(res):
+                    tz_name, start_dt, end_dt = res[row_idx]
+                    # Column detection
+                    if 0 <= mx < zone_w:
+                        if tz_name in state["selected"]:
+                            state["from_idx"] = state["selected"].index(tz_name)
+                            state["focus_main"] = 1
+                            state["cursor_start"] = TIME_FIRST_DIGIT
+                            compute_results(state)
+                            return True
+                    now_x = zone_w + 1
+                    start_x = zone_w + 1 + dt_w + 1
+                    end_x = zone_w + 1 + (dt_w + 1) * 2
+                    if start_x <= mx < start_x + dt_w:
+                        state["start_text"] = start_dt.strftime(INPUT_FMT)
+                        state["focus_main"] = 1
+                        state["cursor_start"] = TIME_FIRST_DIGIT
+                        compute_results(state)
+                        return True
+                    if end_x <= mx < end_x + dt_w:
+                        state["end_text"] = end_dt.strftime(INPUT_FMT)
+                        state["focus_main"] = 2
+                        state["cursor_end"] = TIME_FIRST_DIGIT
+                        compute_results(state)
+                        return True
         return False
 
     action, payload = hit
@@ -990,15 +1060,11 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
     if action == "from_prev":
         if state["selected"]:
             state["from_idx"] = (state["from_idx"] - 1) % len(state["selected"])
-            state["focus_main"] = 1
-            state["cursor_start"] = TIME_FIRST_DIGIT
             compute_results(state)
             return True
     if action == "from_next":
         if state["selected"]:
             state["from_idx"] = (state["from_idx"] + 1) % len(state["selected"])
-            state["focus_main"] = 1
-            state["cursor_start"] = TIME_FIRST_DIGIT
             compute_results(state)
             return True
     if action == "from_toggle":
@@ -1057,7 +1123,7 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
             return True
         return False
 
-    if not (bstate & curses.BUTTON1_CLICKED):
+    if not (bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED)):
         return False
 
     hit = region_hit(state.get("regions", []), mx, my)
@@ -1111,19 +1177,12 @@ def handle_settings_input(key: int, state: dict) -> bool:
     if key == -1:
         return False
 
-    if key in (ord("q"), 27):
-        cancel_settings(state)
-        return True
-
-    if key in (ord("s"), ord("S")):
-        return save_settings(state)
-
     if key == 9:  # Tab
         state["settings_focus"] = (state["settings_focus"] + 1) % 3
         return True
 
-    if key in (ord("o"), ord("O")):
-        state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
+    if key == 27:  # Esc
+        cancel_settings(state)
         return True
 
     if state["settings_focus"] == 0:
@@ -1149,6 +1208,21 @@ def handle_settings_input(key: int, state: dict) -> bool:
             state["all_scroll"] = 0
             return True
         return False
+
+    if key in (ord("q"), ord("Q")):
+        cancel_settings(state)
+        return True
+
+    if key in (ord("m"), ord("M")):
+        set_mouse_enabled(state, not state.get("mouse_enabled"))
+        return True
+
+    if key in (ord("s"), ord("S")):
+        return save_settings(state)
+
+    if key in (ord("o"), ord("O")):
+        state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
+        return True
 
     if state["settings_focus"] == 1:
         # All list
