@@ -47,7 +47,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pytzcvrt.json")
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 DEFAULT_SELECTED = [
     "Asia/Baghdad",
     "Europe/Stockholm",
@@ -249,6 +249,39 @@ def format_dt_local(dt: datetime) -> str:
 def format_dt_local_seconds(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
+def is_numeric_tz_abbr(abbr: str) -> bool:
+    if not abbr:
+        return False
+    for ch in abbr:
+        if ch not in "+-0123456789:":
+            return False
+    return True
+
+
+def format_duration(total_minutes: int) -> str:
+    if total_minutes < 24 * 60:
+        hours = total_minutes // 60
+        minutes = total_minutes % 60
+        return f"{hours:02d}:{minutes:02d}"
+
+    minutes = total_minutes
+    years, minutes = divmod(minutes, 365 * 24 * 60)
+    months, minutes = divmod(minutes, 30 * 24 * 60)
+    days, minutes = divmod(minutes, 24 * 60)
+    hours, minutes = divmod(minutes, 60)
+    parts: list[str] = []
+    if years:
+        parts.append(f"{years}y")
+    if months:
+        parts.append(f"{months}m")
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or not parts:
+        parts.append(f"{minutes}m")
+    return " ".join(parts)
+
 
 def parse_dt(text: str) -> datetime:
     return datetime.strptime(text.strip(), INPUT_FMT)
@@ -292,6 +325,35 @@ def cursor_from_click(rel: int) -> int:
 # Config
 # -----------------------------
 
+def _default_config(
+    all_zones: set[str],
+    box_mode: str,
+    colors_enabled: bool | None,
+    theme_name: str,
+    alarm_enabled: bool,
+    sound_enabled: bool,
+    alarm_duration: int,
+    beep_interval: int,
+    beep_max: int,
+    selected_override: list[str] | None = None,
+) -> tuple[list[str], str, bool | None, str, dict]:
+    selected: list[str] = list(selected_override or [])
+    if not selected:
+        for item in DEFAULT_SELECTED:
+            if item in all_zones:
+                selected.append(item)
+    if not selected and "UTC" in all_zones:
+        selected.append("UTC")
+    alarm_cfg = {
+        "alarm_enabled": alarm_enabled,
+        "sound_enabled": sound_enabled,
+        "alarm_duration": alarm_duration,
+        "beep_interval": beep_interval,
+        "beep_max": beep_max,
+    }
+    return selected, box_mode, colors_enabled, theme_name, alarm_cfg
+
+
 def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str, dict]:
     selected: list[str] = []
     box_mode = "ascii"
@@ -302,6 +364,8 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str, 
     alarm_duration = ALARM_DURATION_DEFAULT
     beep_interval = BEEP_INTERVAL_DEFAULT
     beep_max = BEEP_MAX_DEFAULT
+    if not CONFIG_PATH:
+        return _default_config(all_zones, box_mode, colors_enabled, theme_name, alarm_enabled, sound_enabled, alarm_duration, beep_interval, beep_max)
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -332,23 +396,7 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str, 
         pass
     except Exception:
         pass
-
-    if not selected:
-        for item in DEFAULT_SELECTED:
-            if item in all_zones:
-                selected.append(item)
-
-    if not selected and "UTC" in all_zones:
-        selected.append("UTC")
-
-    alarm_cfg = {
-        "alarm_enabled": alarm_enabled,
-        "sound_enabled": sound_enabled,
-        "alarm_duration": alarm_duration,
-        "beep_interval": beep_interval,
-        "beep_max": beep_max,
-    }
-    return selected, box_mode, colors_enabled, theme_name, alarm_cfg
+    return _default_config(all_zones, box_mode, colors_enabled, theme_name, alarm_enabled, sound_enabled, alarm_duration, beep_interval, beep_max, selected_override=selected)
 
 
 def save_config(
@@ -358,6 +406,8 @@ def save_config(
     theme_name: str,
     alarm_cfg: dict,
 ) -> None:
+    if not CONFIG_PATH:
+        return
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(
@@ -604,9 +654,7 @@ def compute_results(state: dict) -> None:
 
     duration = end - start
     total_minutes = int(duration.total_seconds() // 60)
-    dur_h = total_minutes // 60
-    dur_m = total_minutes % 60
-    state["duration_str"] = f"{dur_h:02d}:{dur_m:02d}"
+    state["duration_str"] = format_duration(total_minutes)
     state["total_minutes"] = total_minutes
 
     results = []
@@ -1038,6 +1086,17 @@ def adjust_alarm_field(state: dict, delta: int) -> None:
         state["settings_beep_max"] = max(1, min(99, val + delta))
 
 
+def toggle_alarm_enabled(state: dict) -> None:
+    state["alarm"].enabled = not state["alarm"].enabled
+    if not state["alarm"].enabled:
+        state["alarm"].armed = False
+        acknowledge_alarm(state)
+    else:
+        # Force re-arm on next tick.
+        state["alarm"].end_instant = None
+        state["alarm"].armed = False
+
+
 def env_allows_unicode() -> bool:
     enc = (sys.stdout.encoding or "").lower()
     loc = (locale.getpreferredencoding(False) or "").lower()
@@ -1126,19 +1185,54 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     mouse_status = "on" if state.get("mouse_enabled") else "off"
     alarm = state["alarm"]
     alarm_status = "on" if alarm.enabled else "off"
-    header_parts = [
-        f"m=mouse({mouse_status})",
-        f"a=alarm({alarm_status})",
-        "?=help",
+    header_segments: list[tuple[str, str | None]] = [
+        (f"m=mouse({mouse_status})", "toggle_mouse"),
+        (f"a=alarm({alarm_status})", "toggle_alarm"),
+        ("?=help", "toggle_help"),
     ]
     if state.get("box_warning"):
-        header_parts.append(state["box_warning"])
+        header_segments.append((state["box_warning"], None))
     if state.get("colors_warning"):
-        header_parts.append(state["colors_warning"])
-    header_lines = wrap_text_lines("  ".join(header_parts), iw)
-    for text in header_lines:
-        add(line, 0, text, "header")
-        line += 1
+        header_segments.append((state["colors_warning"], None))
+
+    def draw_header_segments(y: int, segments: list[tuple[str, str | None]]) -> int:
+        cur_y = y
+        cur_x = 0
+        header_attr = role_attr(state, "header", dim_extra)
+        for text, action in segments:
+            if not text:
+                continue
+            if len(text) > iw:
+                if cur_x:
+                    cur_y += 1
+                    cur_x = 0
+                for wrapped in wrap_text_lines(text, iw):
+                    safe_addstr(stdscr, oy + cur_y, ox + cur_x, wrapped, header_attr)
+                    cur_y += 1
+                cur_x = 0
+                continue
+            sep = "  " if cur_x else ""
+            if cur_x and cur_x + len(sep) + len(text) > iw:
+                cur_y += 1
+                cur_x = 0
+                sep = ""
+            if sep:
+                safe_addstr(stdscr, oy + cur_y, ox + cur_x, sep, header_attr)
+                cur_x += len(sep)
+            safe_addstr(stdscr, oy + cur_y, ox + cur_x, text, header_attr)
+            if action:
+                add_region(
+                    regions,
+                    oy + cur_y,
+                    ox + cur_x,
+                    oy + cur_y,
+                    ox + cur_x + len(text) - 1,
+                    action,
+                )
+            cur_x += len(text)
+        return cur_y + 1
+
+    line = draw_header_segments(line, header_segments)
 
     # Alarm banner (visible until acknowledged or timeout)
     if alarm.active:
@@ -1161,7 +1255,18 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         instants = get_span_instants(state)
         if instants:
             _start_local, end_local = instants
-            add(line, 0, f"Armed for End: {format_dt_compact(end_local)}", "header")
+            delta_seconds = (end_local - now_dt).total_seconds()
+            if delta_seconds > 0:
+                minutes_until = int((delta_seconds + 59) // 60)
+            else:
+                minutes_until = 0
+            minute_label = "minute" if minutes_until == 1 else "minutes"
+            add(
+                line,
+                0,
+                f"Armed for End: {format_dt_compact(end_local)} ({minutes_until} {minute_label})",
+                "header",
+            )
             line += 1
 
     # Buttons
@@ -1195,6 +1300,8 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     value_text = (from_label + " " * from_width)[:from_width]
     value_role = "focus" if state["focus_main"] == 0 else "field"
     flash_extra = curses.A_REVERSE | curses.A_BOLD if flash_active(state, "from", now_mono) else 0
+    if flash_extra and state["focus_main"] == 0:
+        flash_extra |= curses.A_UNDERLINE
     value_attr = role_attr(state, value_role, flash_extra | dim_extra)
     safe_addstr(stdscr, oy + line, ox + x, f"[{value_text}]", value_attr)
     add_region(regions, oy + line, ox + x, oy + line, ox + x + from_width + 1, "from_toggle")
@@ -1344,9 +1451,18 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         f"{vch}{'Start':<{dt_w}}"
         f"{vch}{'End':<{dt_w}}{vch}"
     )
+    v_positions = [
+        table_left,
+        table_left + 1 + zone_w,
+        table_left + 2 + zone_w + dt_w,
+        table_left + 3 + zone_w + (dt_w * 2),
+        table_left + 4 + zone_w + (dt_w * 3),
+    ]
 
     draw_table_hline(table_top, style["tl"], style["tr"], style["tee_u"])
     add(table_top + 1, table_left, header_row, "header")
+    for vx in v_positions:
+        safe_addstr(stdscr, oy + table_top + 1, ox + vx, vch, border_attr)
     draw_table_hline(table_top + 2, style["tee_l"], style["tee_r"], style["cross"])
 
     row_start = table_top + 3
@@ -1357,7 +1473,10 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         now_dt = datetime.now(ZoneInfo(tz_name))
         tz_abbr = now_dt.tzname() or "UTC"
         tz_off = format_offset(now_dt.utcoffset(), with_colon=False)
-        zone_label = f"{tz_name} {tz_abbr}{tz_off}"
+        if is_numeric_tz_abbr(tz_abbr):
+            zone_label = f"{tz_name} {tz_off}"
+        else:
+            zone_label = f"{tz_name} {tz_abbr}{tz_off}"
         now_s = format_dt_local_seconds(now_dt)
         start_s = format_dt_local(start_dt)
         end_s = format_dt_local(end_dt)
@@ -1369,6 +1488,8 @@ def render_main(stdscr: curses.window, state: dict) -> None:
             f"{vch}{end_s:<{dt_w}}{vch}"
         )
         add(y, table_left, row_text)
+        for vx in v_positions:
+            safe_addstr(stdscr, oy + y, ox + vx, vch, border_attr)
         if row_i < row_count - 1:
             draw_table_hline(y + 1, style["tee_l"], style["tee_r"], style["cross"])
 
@@ -1484,7 +1605,7 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
     h, w = stdscr.getmaxyx()
     style = state.get("box_style", BOX_STYLES["ascii"])
 
-    lines = [
+    raw_lines = [
         "Help",
         "",
         "Main keys:",
@@ -1503,7 +1624,7 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
         "",
         "Settings keys:",
         "  Tab/Shift-Tab: focus filter/all/selected panes",
-        "  a/Enter: add    d/Delete: remove    u/j: reorder",
+        "  a/Enter: add    d/Delete: remove    u/j or Ctrl+Up/Down: reorder",
         "  v: view flat/country   o: sort (flat view only)",
         "  c: colors on/off   t: theme   b: box drawing",
         "  l: alarm on/off   n: sound on/off   +/-: adjust alarm field",
@@ -1515,13 +1636,24 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
         "Press ? or Esc to close.",
     ]
 
-    max_len = max((len(line) for line in lines), default=10)
+    max_len = max((len(line) for line in raw_lines), default=10)
     box_w = min(w - 4, max_len + 4)
-    box_h = min(h - 4, len(lines) + 4)
+    box_h = min(h - 4, len(raw_lines) + 4)
     if box_w < 10 or box_h < 6:
         return None
     box_y = max(0, (h - box_h) // 2)
     box_x = max(0, (w - box_w) // 2)
+
+    content_width = max(1, box_w - 4)
+    lines: list[str] = []
+    for line in raw_lines:
+        lines.extend(wrap_text_lines(line, content_width))
+
+    view_h = max(1, box_h - 2)
+    state["help_view_h"] = view_h
+    state["help_total_lines"] = len(lines)
+    state["help_scroll"] = clamp_scroll(state.get("help_scroll", 0), view_h, len(lines))
+    start = state["help_scroll"]
 
     win = curses.newwin(box_h, box_w, box_y, box_x)
     bg_attr = role_attr(state, "dropdown_bg")
@@ -1530,7 +1662,7 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
     border_attr = role_attr(state, "border", curses.A_BOLD)
     draw_box(win, 0, 0, box_h, box_w, style, border_attr)
 
-    for i, line in enumerate(lines[: box_h - 2]):
+    for i, line in enumerate(lines[start : start + view_h]):
         attr = role_attr(state, "header", curses.A_BOLD) if i == 0 else role_attr(state, "base")
         safe_addstr(win, 1 + i, 2, line[: max(0, box_w - 4)], attr)
     return win
@@ -1575,10 +1707,46 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
         return x + width + 1
 
     line = 0
-    settings_header = "Settings (o=sort, v=view)"
-    for text in wrap_text_lines(settings_header, iw):
-        add(line, 0, text, "header")
-        line += 1
+    def draw_settings_header(y: int) -> int:
+        header_attr = role_attr(state, "header", dim_extra)
+        segments = [
+            ("Settings (", None),
+            ("o=sort", "settings_sort"),
+            (", ", None),
+            ("v=view", "settings_view"),
+            (")", None),
+        ]
+        cur_y = y
+        cur_x = 0
+        for text, action in segments:
+            if not text:
+                continue
+            if len(text) > iw:
+                if cur_x:
+                    cur_y += 1
+                    cur_x = 0
+                for wrapped in wrap_text_lines(text, iw):
+                    safe_addstr(stdscr, oy + cur_y, ox + cur_x, wrapped, header_attr)
+                    cur_y += 1
+                cur_x = 0
+                continue
+            if cur_x and cur_x + len(text) > iw:
+                cur_y += 1
+                cur_x = 0
+            safe_addstr(stdscr, oy + cur_y, ox + cur_x, text, header_attr)
+            if action:
+                add_region(
+                    regions,
+                    oy + cur_y,
+                    ox + cur_x,
+                    oy + cur_y,
+                    ox + cur_x + len(text) - 1,
+                    action,
+                )
+            cur_x += len(text)
+        return cur_y + 1
+
+    line = draw_settings_header(line)
     alias_line = "Country view includes aliases inferred from zoneinfo links; unmapped zones go to Other/Unmapped (ZZ)."
     for text in wrap_text_lines(alias_line, iw):
         add(line, 0, text, "base")
@@ -1783,36 +1951,107 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
     safe_addstr(stdscr, oy + alarm_line, ox + x, max_text, max_attr)
     add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(max_text) - 1, "settings_alarm_field", "max")
 
-    # Status line
-    status_parts = [f"View: {VIEW_MODES[state['view_mode']]}"]
+    # Status line with hotkey underlines (v/o/b/c/t)
+    def draw_status_segments(
+        y: int,
+        x: int,
+        segments: list[tuple[str, int | None]],
+        actions: list[str | None] | None = None,
+    ) -> None:
+        cur_x = x
+        base_attr = role_attr(state, "base", dim_extra)
+        for idx, (text, underline_idx) in enumerate(segments):
+            if idx > 0:
+                safe_addstr(stdscr, oy + y, ox + cur_x, " | ", base_attr)
+                cur_x += 3
+            if cur_x >= iw:
+                return
+            seg_start = cur_x
+            action = actions[idx] if actions and idx < len(actions) else None
+            if underline_idx is None or underline_idx < 0 or underline_idx >= len(text):
+                safe_addstr(stdscr, oy + y, ox + cur_x, text, base_attr)
+                visible = min(len(text), max(0, iw - cur_x))
+                if action and visible > 0:
+                    add_region(
+                        regions,
+                        oy + y,
+                        ox + seg_start,
+                        oy + y,
+                        ox + seg_start + visible - 1,
+                        action,
+                    )
+                cur_x += len(text)
+                continue
+            if underline_idx > 0:
+                safe_addstr(stdscr, oy + y, ox + cur_x, text[:underline_idx], base_attr)
+            safe_addstr(
+                stdscr,
+                oy + y,
+                ox + cur_x + underline_idx,
+                text[underline_idx],
+                base_attr | curses.A_UNDERLINE,
+            )
+            if underline_idx + 1 < len(text):
+                safe_addstr(
+                    stdscr,
+                    oy + y,
+                    ox + cur_x + underline_idx + 1,
+                    text[underline_idx + 1 :],
+                    base_attr,
+                )
+            visible = min(len(text), max(0, iw - cur_x))
+            if action and visible > 0:
+                add_region(
+                    regions,
+                    oy + y,
+                    ox + seg_start,
+                    oy + y,
+                    ox + seg_start + visible - 1,
+                    action,
+                )
+            cur_x += len(text)
+
+    status_parts: list[tuple[str, int | None]] = []
+    status_actions: list[str | None] = []
+    status_parts.append((f"View: {VIEW_MODES[state['view_mode']]}", 0))
+    status_actions.append("settings_view")
     if state["view_mode"] == 0:
-        status_parts.append(f"Sort: {SORT_MODES[state['sort_mode']]}")
-    status_parts.append(f"Box: {state.get('settings_box_mode', state['box_mode']).upper()}")
+        status_parts.append((f"Sort: {SORT_MODES[state['sort_mode']]}", 1))
+        status_actions.append("settings_sort")
+    status_parts.append((f"Box: {state.get('settings_box_mode', state['box_mode']).upper()}", 0))
+    status_actions.append("settings_box")
     if not state.get("colors_supported"):
-        status_parts.append("Colors: unsupported")
+        status_parts.append(("Colors: unsupported", 0))
+        status_actions.append("settings_colors")
     else:
         colors_on = "on" if state.get("settings_colors_enabled") else "off"
-        status_parts.append(f"Colors: {colors_on}")
-    status_parts.append(f"Theme: {state.get('settings_theme', state.get('theme_name', 'default'))}")
+        status_parts.append((f"Colors: {colors_on}", 0))
+        status_actions.append("settings_colors")
+    status_parts.append((f"Theme: {state.get('settings_theme', state.get('theme_name', 'default'))}", 0))
+    status_actions.append("settings_theme")
     if state.get("country_error"):
-        status_parts.append(f"Error: {state['country_error']}")
+        status_parts.append((f"Error: {state['country_error']}", None))
+        status_actions.append(None)
     box_warn = state.get("box_warning")
     if state.get("settings_box_mode") == "unicode" and not state.get("unicode_supported"):
         box_warn = "Unicode box drawing not supported; using ASCII."
     if box_warn:
-        status_parts.append(box_warn)
+        status_parts.append((box_warn, None))
+        status_actions.append(None)
     if state.get("colors_warning"):
-        status_parts.append(state["colors_warning"])
+        status_parts.append((state["colors_warning"], None))
+        status_actions.append(None)
     if view_mode == 1 and rows:
         idx = state["all_idx"]
         if 0 <= idx < len(rows):
             row = rows[idx]
             if row.kind == "tz" and row.is_alias and row.alias_target:
-                status_parts.append(f"Alias of {row.alias_target}")
+                status_parts.append((f"Alias of {row.alias_target}", None))
+                status_actions.append(None)
     if state.get("settings_msg"):
-        status_parts.append(state["settings_msg"])
-    status = " | ".join(status_parts)
-    add(ih - 1, 0, status)
+        status_parts.append((state["settings_msg"], None))
+        status_actions.append(None)
+    draw_status_segments(ih - 1, 0, status_parts, status_actions)
 
     # Cursor for filter
     if state.get("help_open"):
@@ -1914,6 +2153,27 @@ def settings_move_down(state: dict) -> None:
         return
     items[idx + 1], items[idx] = items[idx], items[idx + 1]
     state["sel_idx"] += 1
+
+
+def toggle_view_mode(state: dict) -> None:
+    if state.get("country_error"):
+        state["settings_msg"] = "Country view unavailable."
+        return
+    state["view_mode"] = (state["view_mode"] + 1) % len(VIEW_MODES)
+    state["all_idx"] = 0
+    state["all_scroll"] = 0
+    state["all_scroll_manual"] = False
+    if state["view_mode"] == 0:
+        state["settings_msg"] = ""
+
+
+def toggle_sort_mode(state: dict) -> None:
+    if state["view_mode"] == 0:
+        state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
+        state["settings_msg"] = ""
+        state["all_scroll_manual"] = False
+    else:
+        state["settings_msg"] = "Sort modes only in flat view."
 
 
 def open_settings(state: dict) -> None:
@@ -2020,9 +2280,12 @@ def cancel_settings(state: dict) -> None:
 # Input handling
 # -----------------------------
 
-def reset_inputs(state: dict) -> None:
+def reset_inputs(state: dict, flash: bool = False) -> None:
     if not state["selected"]:
         return
+    state["from_idx"] = 0
+    state["from_list_idx"] = 0
+    state["from_list_open"] = False
     tz = ZoneInfo(state["selected"][state["from_idx"]])
     now = datetime.now(tz).replace(second=0, microsecond=0)
     start = now
@@ -2031,6 +2294,12 @@ def reset_inputs(state: dict) -> None:
     state["end_text"] = end.strftime(INPUT_FMT)
     state["cursor_start"] = TIME_FIRST_DIGIT
     state["cursor_end"] = TIME_FIRST_DIGIT
+    if flash:
+        now_mono = time.monotonic()
+        flash_until = state.setdefault("flash_until", {})
+        flash_until["from"] = now_mono + FLASH_DURATION
+        flash_until["start"] = now_mono + FLASH_DURATION
+        flash_until["end"] = now_mono + FLASH_DURATION
 
 
 def handle_main_input(key: int, state: dict) -> bool:
@@ -2041,6 +2310,26 @@ def handle_main_input(key: int, state: dict) -> bool:
         acknowledge_alarm(state)
 
     if state.get("help_open"):
+        if key in (curses.KEY_UP,):
+            state["help_scroll"] = state.get("help_scroll", 0) - 1
+            return True
+        if key in (curses.KEY_DOWN,):
+            state["help_scroll"] = state.get("help_scroll", 0) + 1
+            return True
+        if key in (curses.KEY_NPAGE,):
+            page = max(1, state.get("help_view_h", 1) - 1)
+            state["help_scroll"] = state.get("help_scroll", 0) + page
+            return True
+        if key in (curses.KEY_PPAGE,):
+            page = max(1, state.get("help_view_h", 1) - 1)
+            state["help_scroll"] = state.get("help_scroll", 0) - page
+            return True
+        if key in (curses.KEY_HOME,):
+            state["help_scroll"] = 0
+            return True
+        if key in (curses.KEY_END,):
+            state["help_scroll"] = state.get("help_total_lines", 1)
+            return True
         if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
             state["help_open"] = False
             return True
@@ -2054,17 +2343,11 @@ def handle_main_input(key: int, state: dict) -> bool:
         state["help_open"] = not state.get("help_open")
         if state["help_open"]:
             state["from_list_open"] = False
+            state["help_scroll"] = 0
         return True
 
     if key in (ord("a"), ord("A")):
-        state["alarm"].enabled = not state["alarm"].enabled
-        if not state["alarm"].enabled:
-            state["alarm"].armed = False
-            acknowledge_alarm(state)
-        else:
-            # Force re-arm on next tick.
-            state["alarm"].end_instant = None
-            state["alarm"].armed = False
+        toggle_alarm_enabled(state)
         return True
 
     if key in (ord("s"), ord("S")):
@@ -2072,7 +2355,7 @@ def handle_main_input(key: int, state: dict) -> bool:
         return True
 
     if key in (ord("r"), ord("R")):
-        reset_inputs(state)
+        reset_inputs(state, flash=True)
         compute_results(state)
         return True
 
@@ -2212,6 +2495,12 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
         acknowledge_alarm(state)
 
     if state.get("help_open"):
+        if bstate & curses.BUTTON4_PRESSED:
+            state["help_scroll"] = state.get("help_scroll", 0) - 1
+            return True
+        if bstate & curses.BUTTON5_PRESSED:
+            state["help_scroll"] = state.get("help_scroll", 0) + 1
+            return True
         if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
             state["help_open"] = False
             return True
@@ -2311,7 +2600,7 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
     action, payload = hit
 
     if action == "button_reset":
-        reset_inputs(state)
+        reset_inputs(state, flash=True)
         compute_results(state)
         return True
     if action == "button_settings":
@@ -2320,6 +2609,16 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
     if action == "button_quit":
         state["quit"] = True
         return False
+    if action == "toggle_mouse":
+        set_mouse_enabled(state, not state.get("mouse_enabled"))
+        return True
+    if action == "toggle_alarm":
+        toggle_alarm_enabled(state)
+        return True
+    if action == "toggle_help":
+        state["help_open"] = True
+        state["from_list_open"] = False
+        return True
 
     if action == "from_prev":
         if state["selected"]:
@@ -2364,6 +2663,12 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
         acknowledge_alarm(state)
 
     if state.get("help_open"):
+        if bstate & curses.BUTTON4_PRESSED:
+            state["help_scroll"] = state.get("help_scroll", 0) - 1
+            return True
+        if bstate & curses.BUTTON5_PRESSED:
+            state["help_scroll"] = state.get("help_scroll", 0) + 1
+            return True
         if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
             state["help_open"] = False
             return True
@@ -2426,6 +2731,12 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
             return save_settings(state)
         if action == "settings_cancel":
             cancel_settings(state)
+            return True
+        if action == "settings_view":
+            toggle_view_mode(state)
+            return True
+        if action == "settings_sort":
+            toggle_sort_mode(state)
             return True
         if action == "settings_box":
             current = state.get("settings_box_mode", "ascii")
@@ -2522,6 +2833,26 @@ def handle_settings_input(key: int, state: dict) -> bool:
         acknowledge_alarm(state)
 
     if state.get("help_open"):
+        if key in (curses.KEY_UP,):
+            state["help_scroll"] = state.get("help_scroll", 0) - 1
+            return True
+        if key in (curses.KEY_DOWN,):
+            state["help_scroll"] = state.get("help_scroll", 0) + 1
+            return True
+        if key in (curses.KEY_NPAGE,):
+            page = max(1, state.get("help_view_h", 1) - 1)
+            state["help_scroll"] = state.get("help_scroll", 0) + page
+            return True
+        if key in (curses.KEY_PPAGE,):
+            page = max(1, state.get("help_view_h", 1) - 1)
+            state["help_scroll"] = state.get("help_scroll", 0) - page
+            return True
+        if key in (curses.KEY_HOME,):
+            state["help_scroll"] = 0
+            return True
+        if key in (curses.KEY_END,):
+            state["help_scroll"] = state.get("help_total_lines", 1)
+            return True
         if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
             state["help_open"] = False
             return True
@@ -2529,6 +2860,7 @@ def handle_settings_input(key: int, state: dict) -> bool:
 
     if key == ord("?"):
         state["help_open"] = True
+        state["help_scroll"] = 0
         return True
 
     if key == 9:  # Tab
@@ -2635,24 +2967,11 @@ def handle_settings_input(key: int, state: dict) -> bool:
         return True
 
     if key in (ord("v"), ord("V")):
-        if state.get("country_error"):
-            state["settings_msg"] = "Country view unavailable."
-            return True
-        state["view_mode"] = (state["view_mode"] + 1) % len(VIEW_MODES)
-        state["all_idx"] = 0
-        state["all_scroll"] = 0
-        if state["view_mode"] == 0:
-            state["settings_msg"] = ""
-        state["all_scroll_manual"] = False
+        toggle_view_mode(state)
         return True
 
     if key in (ord("o"), ord("O")):
-        if state["view_mode"] == 0:
-            state["sort_mode"] = (state["sort_mode"] + 1) % len(SORT_MODES)
-            state["settings_msg"] = ""
-            state["all_scroll_manual"] = False
-        else:
-            state["settings_msg"] = "Sort modes only in flat view."
+        toggle_sort_mode(state)
         return True
 
     if state["settings_focus"] == 1:
@@ -2764,10 +3083,14 @@ def handle_settings_input(key: int, state: dict) -> bool:
         if key in (ord("d"), ord("D"), curses.KEY_DC):
             settings_remove(state)
             return True
-        if key in (ord("u"), ord("U")):
+        if key in (ord("u"), ord("U"), 575) or (
+            getattr(curses, "KEY_SR", None) is not None and key == curses.KEY_SR
+        ):
             settings_move_up(state)
             return True
-        if key in (ord("j"), ord("J")):
+        if key in (ord("j"), ord("J"), 534) or (
+            getattr(curses, "KEY_SF", None) is not None and key == curses.KEY_SF
+        ):
             settings_move_down(state)
             return True
 
@@ -2819,6 +3142,9 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
         "beep_max": int(alarm_cfg.get("beep_max", BEEP_MAX_DEFAULT)),
         "flash_until": {},
         "help_open": False,
+        "help_scroll": 0,
+        "help_view_h": 0,
+        "help_total_lines": 0,
         "regions": [],
         "mouse_enabled": False,
         "settings_open": False,
@@ -2930,7 +3256,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
         epilog="CLI flags override config for this run only; settings are saved only via the TUI.",
     )
-    parser.add_argument("--config", help="Override config file path for this run.")
+    parser.add_argument(
+        "--config",
+        nargs="?",
+        const="",
+        help="Override config file path for this run (omit path to disable config).",
+    )
     parser.add_argument("--no-mouse", action="store_true", help="Disable mouse support for this run.")
     parser.add_argument("--no-color", action="store_true", help="Start with colors disabled.")
     group = parser.add_mutually_exclusive_group()
@@ -2943,7 +3274,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def run(argv: list[str] | None = None) -> int:
     try:
         args = parse_args(argv)
-        if args.config:
+        if args.config is not None:
             global CONFIG_PATH
             CONFIG_PATH = args.config
         # Enable wide-char support in curses based on the current locale.
