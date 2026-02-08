@@ -42,12 +42,12 @@ import sys
 import textwrap
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, available_timezones
 
 CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".pytzcvrt.json")
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 DEFAULT_SELECTED = [
     "Asia/Baghdad",
     "Europe/Stockholm",
@@ -70,6 +70,9 @@ FIRST_DIGIT = DIGIT_POSITIONS[0]
 LAST_DIGIT = DIGIT_POSITIONS[-1]
 TIME_FIRST_DIGIT = INPUT_TEMPLATE.index(" ") + 1
 FLASH_DURATION = 0.5
+ALARM_DURATION_DEFAULT = 10
+BEEP_INTERVAL_DEFAULT = 2
+BEEP_MAX_DEFAULT = 5
 
 SORT_MODES = [
     "Name (A-Z)",
@@ -193,6 +196,21 @@ class ZoneEntry:
     alias_target: str | None = None
 
 
+@dataclass
+class AlarmState:
+    enabled: bool = True
+    sound_enabled: bool = True
+    armed: bool = False
+    end_instant: datetime | None = None  # stored in UTC
+    active: bool = False
+    acknowledged: bool = False
+    last_now: datetime | None = None
+    started_at_monotonic: float | None = None
+    last_beep_monotonic: float | None = None
+    beeps_sent: int = 0
+    just_triggered: bool = False
+
+
 # -----------------------------
 # Helpers: formatting and digits
 # -----------------------------
@@ -274,11 +292,16 @@ def cursor_from_click(rel: int) -> int:
 # Config
 # -----------------------------
 
-def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str]:
+def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str, dict]:
     selected: list[str] = []
     box_mode = "ascii"
     colors_enabled: bool | None = None
     theme_name = "default"
+    alarm_enabled = True
+    sound_enabled = True
+    alarm_duration = ALARM_DURATION_DEFAULT
+    beep_interval = BEEP_INTERVAL_DEFAULT
+    beep_max = BEEP_MAX_DEFAULT
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -295,6 +318,16 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str]:
                 theme = data.get("theme")
                 if isinstance(theme, str) and theme in THEMES:
                     theme_name = theme
+                if isinstance(data.get("alarm_enabled"), bool):
+                    alarm_enabled = data["alarm_enabled"]
+                if isinstance(data.get("sound_enabled"), bool):
+                    sound_enabled = data["sound_enabled"]
+                if isinstance(data.get("alarm_duration"), int) and data["alarm_duration"] > 0:
+                    alarm_duration = data["alarm_duration"]
+                if isinstance(data.get("beep_interval"), int) and data["beep_interval"] > 0:
+                    beep_interval = data["beep_interval"]
+                if isinstance(data.get("beep_max"), int) and data["beep_max"] > 0:
+                    beep_max = data["beep_max"]
     except FileNotFoundError:
         pass
     except Exception:
@@ -308,10 +341,23 @@ def load_config(all_zones: set[str]) -> tuple[list[str], str, bool | None, str]:
     if not selected and "UTC" in all_zones:
         selected.append("UTC")
 
-    return selected, box_mode, colors_enabled, theme_name
+    alarm_cfg = {
+        "alarm_enabled": alarm_enabled,
+        "sound_enabled": sound_enabled,
+        "alarm_duration": alarm_duration,
+        "beep_interval": beep_interval,
+        "beep_max": beep_max,
+    }
+    return selected, box_mode, colors_enabled, theme_name, alarm_cfg
 
 
-def save_config(selected: list[str], box_mode: str, colors_enabled: bool, theme_name: str) -> None:
+def save_config(
+    selected: list[str],
+    box_mode: str,
+    colors_enabled: bool,
+    theme_name: str,
+    alarm_cfg: dict,
+) -> None:
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(
@@ -320,6 +366,11 @@ def save_config(selected: list[str], box_mode: str, colors_enabled: bool, theme_
                     "box_drawing": box_mode,
                     "colors_enabled": colors_enabled,
                     "theme": theme_name,
+                    "alarm_enabled": bool(alarm_cfg.get("alarm_enabled", True)),
+                    "sound_enabled": bool(alarm_cfg.get("sound_enabled", True)),
+                    "alarm_duration": int(alarm_cfg.get("alarm_duration", ALARM_DURATION_DEFAULT)),
+                    "beep_interval": int(alarm_cfg.get("beep_interval", BEEP_INTERVAL_DEFAULT)),
+                    "beep_max": int(alarm_cfg.get("beep_max", BEEP_MAX_DEFAULT)),
                 },
                 f,
                 indent=2,
@@ -579,6 +630,22 @@ def get_span_start_instant(state: dict) -> datetime | None:
     except ValueError:
         return None
     return start_naive.replace(tzinfo=from_tz)
+
+
+def get_span_instants(state: dict) -> tuple[datetime, datetime] | None:
+    if not state["selected"]:
+        return None
+    from_tz = ZoneInfo(state["selected"][state["from_idx"]])
+    try:
+        start_naive = parse_dt(state["start_text"])
+        end_naive = parse_dt(state["end_text"])
+    except ValueError:
+        return None
+    start = start_naive.replace(tzinfo=from_tz)
+    end = end_naive.replace(tzinfo=from_tz)
+    if end < start:
+        return None
+    return start, end
 
 
 def offset_seconds_for(tz_name: str, instant: datetime | None) -> int:
@@ -863,6 +930,114 @@ def flash_active(state: dict, key: str, now: float) -> bool:
     return now < state.get("flash_until", {}).get(key, 0.0)
 
 
+def trigger_alarm(state: dict, now_mono: float) -> None:
+    alarm: AlarmState = state["alarm"]
+    alarm.active = True
+    alarm.acknowledged = False
+    alarm.started_at_monotonic = now_mono
+    alarm.last_beep_monotonic = None
+    alarm.beeps_sent = 0
+    alarm.just_triggered = True
+
+
+def acknowledge_alarm(state: dict) -> None:
+    alarm: AlarmState = state["alarm"]
+    if alarm.active:
+        alarm.acknowledged = True
+        alarm.active = False
+
+
+def update_alarm(state: dict, now_utc: datetime, now_mono: float) -> bool:
+    alarm: AlarmState = state["alarm"]
+    changed = False
+    alarm.just_triggered = False
+
+    if not alarm.enabled:
+        if alarm.active or alarm.armed:
+            changed = True
+        alarm.active = False
+        alarm.armed = False
+        alarm.acknowledged = False
+        alarm.last_now = now_utc
+        return changed
+
+    instants = get_span_instants(state)
+    if not instants:
+        if alarm.active or alarm.armed or alarm.end_instant:
+            changed = True
+        alarm.active = False
+        alarm.armed = False
+        alarm.end_instant = None
+        alarm.last_now = now_utc
+        return changed
+
+    _start, end_local = instants
+    end_utc = end_local.astimezone(timezone.utc)
+
+    if alarm.end_instant != end_utc:
+        alarm.end_instant = end_utc
+        alarm.armed = True
+        alarm.active = False
+        alarm.acknowledged = False
+        alarm.started_at_monotonic = None
+        alarm.last_beep_monotonic = None
+        alarm.beeps_sent = 0
+        alarm.last_now = now_utc
+        return True
+
+    if alarm.active:
+        duration = max(1, int(state.get("alarm_duration", ALARM_DURATION_DEFAULT)))
+        if alarm.started_at_monotonic is not None:
+            if now_mono - alarm.started_at_monotonic >= duration:
+                alarm.active = False
+                alarm.acknowledged = True
+                changed = True
+        alarm.last_now = now_utc
+        return changed
+
+    if alarm.armed and alarm.last_now is not None:
+        if alarm.last_now < end_utc <= now_utc:
+            trigger_alarm(state, now_mono)
+            changed = True
+
+    alarm.last_now = now_utc
+    return changed
+
+
+def alarm_beep(state: dict) -> None:
+    if not state["alarm"].sound_enabled:
+        return
+    try:
+        curses.beep()
+    except curses.error:
+        pass
+    try:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def alarm_flash() -> None:
+    try:
+        curses.flash()
+    except curses.error:
+        pass
+
+
+def adjust_alarm_field(state: dict, delta: int) -> None:
+    field = state.get("settings_alarm_field", "duration")
+    if field == "duration":
+        val = int(state.get("settings_alarm_duration", ALARM_DURATION_DEFAULT))
+        state["settings_alarm_duration"] = max(1, min(3600, val + delta))
+    elif field == "beep":
+        val = int(state.get("settings_beep_interval", BEEP_INTERVAL_DEFAULT))
+        state["settings_beep_interval"] = max(1, min(60, val + delta))
+    elif field == "max":
+        val = int(state.get("settings_beep_max", BEEP_MAX_DEFAULT))
+        state["settings_beep_max"] = max(1, min(99, val + delta))
+
+
 def env_allows_unicode() -> bool:
     enc = (sys.stdout.encoding or "").lower()
     loc = (locale.getpreferredencoding(False) or "").lower()
@@ -949,8 +1124,11 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     add(line, 0, f"pytzcvrt v{__version__} - time zone span converter", "header")
     line += 1
     mouse_status = "on" if state.get("mouse_enabled") else "off"
+    alarm = state["alarm"]
+    alarm_status = "on" if alarm.enabled else "off"
     header_parts = [
         f"m=mouse({mouse_status})",
+        f"a=alarm({alarm_status})",
         "?=help",
     ]
     if state.get("box_warning"):
@@ -962,6 +1140,14 @@ def render_main(stdscr: curses.window, state: dict) -> None:
         add(line, 0, text, "header")
         line += 1
 
+    # Alarm banner (visible until acknowledged or timeout)
+    if alarm.active:
+        blink_on = int(now_mono * 2) % 2 == 0
+        extra = (curses.A_REVERSE | curses.A_BOLD) if blink_on else curses.A_BOLD
+        attr = role_attr(state, "error", extra | dim_extra)
+        safe_addstr(stdscr, oy + line, ox + 0, "ALARM: End reached", attr)
+        line += 1
+
     # Header: show now for current From TZ
     if state["selected"]:
         from_name = state["selected"][state["from_idx"]]
@@ -970,6 +1156,13 @@ def render_main(stdscr: curses.window, state: dict) -> None:
     else:
         add(line, 0, "Now: (no selected zones)", "header")
     line += 1
+
+    if alarm.armed and alarm.end_instant:
+        instants = get_span_instants(state)
+        if instants:
+            _start_local, end_local = instants
+            add(line, 0, f"Armed for End: {format_dt_compact(end_local)}", "header")
+            line += 1
 
     # Buttons
     x = 0
@@ -1295,7 +1488,7 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
         "Help",
         "",
         "Main keys:",
-        "  s: settings   r: reset   q: quit   m: mouse on/off",
+        "  s: settings   r: reset   q: quit   m: mouse on/off   a: alarm on/off",
         "  Tab/Shift-Tab: move between From TZ, Start, End",
         "  Up/Down: change From TZ (dropdown closed)",
         "  Enter: open From TZ dropdown or move to next field",
@@ -1305,11 +1498,16 @@ def render_help_overlay(stdscr: curses.window, state: dict) -> curses.window | N
         "  Click fields or buttons; wheel scrolls results",
         "  Click results cells: Zone sets From TZ; Start/End/Now sets fields",
         "",
+        "Alarm:",
+        "  Any key acknowledges and stops the alarm banner/beeps",
+        "",
         "Settings keys:",
         "  Tab/Shift-Tab: focus filter/all/selected panes",
         "  a/Enter: add    d/Delete: remove    u/j: reorder",
         "  v: view flat/country   o: sort (flat view only)",
         "  c: colors on/off   t: theme   b: box drawing",
+        "  l: alarm on/off   n: sound on/off   +/-: adjust alarm field",
+        "  Alarm fields: Dur=visual seconds, Beep=interval seconds, Max=beep count",
         "  s: save   q/Esc: cancel",
         "",
         "Country view: aliases inferred from zoneinfo links; unmapped in Other/Unmapped (ZZ).",
@@ -1525,6 +1723,66 @@ def render_settings(stdscr: curses.window, state: dict) -> None:
     theme_label = f"heme:{state.get('settings_theme', 'default')}"
     x = btn(btn_y, x, "T", theme_label, "settings_theme")
 
+    # Alarm settings line
+    alarm_line = ih - 2
+    x = 0
+    alarm_on = "On" if state.get("settings_alarm_enabled", True) else "Off"
+    sound_on = "On" if state.get("settings_sound_enabled", True) else "Off"
+    alarm_field = state.get("settings_alarm_field", "duration")
+    dur = int(state.get("settings_alarm_duration", ALARM_DURATION_DEFAULT))
+    beep = int(state.get("settings_beep_interval", BEEP_INTERVAL_DEFAULT))
+    bmax = int(state.get("settings_beep_max", BEEP_MAX_DEFAULT))
+
+    base_attr = role_attr(state, "base", dim_extra)
+    def draw_hotkey_label(y: int, x: int, label: str, hot_char: str) -> int:
+        idx = label.lower().find(hot_char.lower())
+        if idx == -1:
+            safe_addstr(stdscr, oy + y, ox + x, label, base_attr)
+            return x + len(label)
+        if idx > 0:
+            safe_addstr(stdscr, oy + y, ox + x, label[:idx], base_attr)
+        safe_addstr(stdscr, oy + y, ox + x + idx, label[idx], base_attr | curses.A_UNDERLINE)
+        if idx + 1 < len(label):
+            safe_addstr(stdscr, oy + y, ox + x + idx + 1, label[idx + 1 :], base_attr)
+        return x + len(label)
+
+    x = draw_hotkey_label(alarm_line, x, "Alarm: ", "l")
+    alarm_attr = role_attr(state, "focus") if alarm_field == "alarm" else role_attr(state, "field")
+    alarm_text = f"[{alarm_on}]"
+    safe_addstr(stdscr, oy + alarm_line, ox + x, alarm_text, alarm_attr)
+    add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(alarm_text) - 1, "settings_alarm_toggle")
+    x += len(alarm_text) + 2
+
+    x = draw_hotkey_label(alarm_line, x, "Sound: ", "n")
+    sound_attr = role_attr(state, "focus") if alarm_field == "sound" else role_attr(state, "field")
+    sound_text = f"[{sound_on}]"
+    safe_addstr(stdscr, oy + alarm_line, ox + x, sound_text, sound_attr)
+    add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(sound_text) - 1, "settings_sound_toggle")
+    x += len(sound_text) + 2
+
+    add(alarm_line, x, "Dur: ", "base")
+    x += len("Dur: ")
+    dur_attr = role_attr(state, "focus") if alarm_field == "duration" else role_attr(state, "field")
+    dur_text = f"[{dur}s]"
+    safe_addstr(stdscr, oy + alarm_line, ox + x, dur_text, dur_attr)
+    add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(dur_text) - 1, "settings_alarm_field", "duration")
+    x += len(dur_text) + 2
+
+    add(alarm_line, x, "Beep: ", "base")
+    x += len("Beep: ")
+    beep_attr = role_attr(state, "focus") if alarm_field == "beep" else role_attr(state, "field")
+    beep_text = f"[{beep}s]"
+    safe_addstr(stdscr, oy + alarm_line, ox + x, beep_text, beep_attr)
+    add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(beep_text) - 1, "settings_alarm_field", "beep")
+    x += len(beep_text) + 2
+
+    add(alarm_line, x, "Max: ", "base")
+    x += len("Max: ")
+    max_attr = role_attr(state, "focus") if alarm_field == "max" else role_attr(state, "field")
+    max_text = f"[{bmax}]"
+    safe_addstr(stdscr, oy + alarm_line, ox + x, max_text, max_attr)
+    add_region(regions, oy + alarm_line, ox + x, oy + alarm_line, ox + x + len(max_text) - 1, "settings_alarm_field", "max")
+
     # Status line
     status_parts = [f"View: {VIEW_MODES[state['view_mode']]}"]
     if state["view_mode"] == 0:
@@ -1665,11 +1923,22 @@ def open_settings(state: dict) -> None:
     state["settings_box_mode"] = state.get("box_mode", "ascii")
     state["settings_colors_enabled"] = state.get("colors_enabled", False)
     state["settings_theme"] = state.get("theme_name", "default")
+    state["settings_alarm_enabled"] = state["alarm"].enabled
+    state["settings_sound_enabled"] = state["alarm"].sound_enabled
+    state["settings_alarm_duration"] = state.get("alarm_duration", ALARM_DURATION_DEFAULT)
+    state["settings_beep_interval"] = state.get("beep_interval", BEEP_INTERVAL_DEFAULT)
+    state["settings_beep_max"] = state.get("beep_max", BEEP_MAX_DEFAULT)
     state["settings_original_box_mode"] = state.get("box_mode", "ascii")
     state["settings_original_colors"] = state.get("colors_enabled", False)
     state["settings_original_theme"] = state.get("theme_name", "default")
+    state["settings_original_alarm_enabled"] = state["alarm"].enabled
+    state["settings_original_sound_enabled"] = state["alarm"].sound_enabled
+    state["settings_original_alarm_duration"] = state.get("alarm_duration", ALARM_DURATION_DEFAULT)
+    state["settings_original_beep_interval"] = state.get("beep_interval", BEEP_INTERVAL_DEFAULT)
+    state["settings_original_beep_max"] = state.get("beep_max", BEEP_MAX_DEFAULT)
     state["settings_focus"] = 1
     state["help_open"] = False
+    state["settings_alarm_field"] = "duration"
     state["all_scroll_manual"] = False
     state["sel_scroll_manual"] = False
     state["filter_text"] = ""
@@ -1693,7 +1962,31 @@ def save_settings(state: dict) -> bool:
         bool(state.get("settings_colors_enabled")),
         state.get("settings_theme", state.get("theme_name", "default")),
     )
-    save_config(state["selected"], state["box_mode"], state.get("colors_enabled", False), state.get("theme_name", "default"))
+    state["alarm"].enabled = bool(state.get("settings_alarm_enabled", True))
+    state["alarm"].sound_enabled = bool(state.get("settings_sound_enabled", True))
+    state["alarm_duration"] = int(state.get("settings_alarm_duration", ALARM_DURATION_DEFAULT))
+    state["beep_interval"] = int(state.get("settings_beep_interval", BEEP_INTERVAL_DEFAULT))
+    state["beep_max"] = int(state.get("settings_beep_max", BEEP_MAX_DEFAULT))
+    if not state["alarm"].enabled:
+        state["alarm"].armed = False
+        acknowledge_alarm(state)
+    else:
+        state["alarm"].end_instant = None
+        state["alarm"].armed = False
+    alarm_cfg = {
+        "alarm_enabled": state["alarm"].enabled,
+        "sound_enabled": state["alarm"].sound_enabled,
+        "alarm_duration": state.get("alarm_duration", ALARM_DURATION_DEFAULT),
+        "beep_interval": state.get("beep_interval", BEEP_INTERVAL_DEFAULT),
+        "beep_max": state.get("beep_max", BEEP_MAX_DEFAULT),
+    }
+    save_config(
+        state["selected"],
+        state["box_mode"],
+        state.get("colors_enabled", False),
+        state.get("theme_name", "default"),
+        alarm_cfg,
+    )
     state["settings_open"] = False
     state["from_list_open"] = False
     compute_results(state)
@@ -1709,6 +2002,17 @@ def cancel_settings(state: dict) -> None:
         bool(state.get("settings_original_colors", state.get("colors_enabled", False))),
         state.get("settings_original_theme", state.get("theme_name", "default")),
     )
+    state["alarm"].enabled = bool(state.get("settings_original_alarm_enabled", True))
+    state["alarm"].sound_enabled = bool(state.get("settings_original_sound_enabled", True))
+    state["alarm_duration"] = int(state.get("settings_original_alarm_duration", ALARM_DURATION_DEFAULT))
+    state["beep_interval"] = int(state.get("settings_original_beep_interval", BEEP_INTERVAL_DEFAULT))
+    state["beep_max"] = int(state.get("settings_original_beep_max", BEEP_MAX_DEFAULT))
+    if not state["alarm"].enabled:
+        state["alarm"].armed = False
+        acknowledge_alarm(state)
+    else:
+        state["alarm"].end_instant = None
+        state["alarm"].armed = False
     state["settings_msg"] = ""
 
 
@@ -1733,6 +2037,9 @@ def handle_main_input(key: int, state: dict) -> bool:
     if key == -1:
         return False
 
+    if state["alarm"].active:
+        acknowledge_alarm(state)
+
     if state.get("help_open"):
         if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
             state["help_open"] = False
@@ -1747,6 +2054,17 @@ def handle_main_input(key: int, state: dict) -> bool:
         state["help_open"] = not state.get("help_open")
         if state["help_open"]:
             state["from_list_open"] = False
+        return True
+
+    if key in (ord("a"), ord("A")):
+        state["alarm"].enabled = not state["alarm"].enabled
+        if not state["alarm"].enabled:
+            state["alarm"].armed = False
+            acknowledge_alarm(state)
+        else:
+            # Force re-arm on next tick.
+            state["alarm"].end_instant = None
+            state["alarm"].armed = False
         return True
 
     if key in (ord("s"), ord("S")):
@@ -1890,6 +2208,9 @@ def handle_main_input(key: int, state: dict) -> bool:
 # -----------------------------
 
 def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
+    if state["alarm"].active and bstate:
+        acknowledge_alarm(state)
+
     if state.get("help_open"):
         if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
             state["help_open"] = False
@@ -2039,6 +2360,9 @@ def handle_mouse_main(state: dict, mx: int, my: int, bstate: int) -> bool:
 
 
 def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
+    if state["alarm"].active and bstate:
+        acknowledge_alarm(state)
+
     if state.get("help_open"):
         if bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_RELEASED | curses.BUTTON1_PRESSED):
             state["help_open"] = False
@@ -2138,6 +2462,17 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
             state["filter_cursor"] = len(state["filter_text"])
             state["all_scroll_manual"] = False
             return True
+        if action == "settings_alarm_toggle":
+            state["settings_alarm_enabled"] = not state.get("settings_alarm_enabled", True)
+            state["settings_alarm_field"] = "alarm"
+            return True
+        if action == "settings_sound_toggle":
+            state["settings_sound_enabled"] = not state.get("settings_sound_enabled", True)
+            state["settings_alarm_field"] = "sound"
+            return True
+        if action == "settings_alarm_field" and isinstance(_payload, str):
+            state["settings_alarm_field"] = _payload
+            return True
 
     # Click inside panes
     if all_box and all_box[0] <= my < all_box[0] + all_box[2] and all_box[1] <= mx < all_box[1] + all_box[3]:
@@ -2182,6 +2517,9 @@ def handle_mouse_settings(state: dict, mx: int, my: int, bstate: int) -> bool:
 def handle_settings_input(key: int, state: dict) -> bool:
     if key == -1:
         return False
+
+    if state["alarm"].active:
+        acknowledge_alarm(state)
 
     if state.get("help_open"):
         if key in (ord("?"), 27, ord("q"), ord("Q"), 10, 13):
@@ -2234,6 +2572,23 @@ def handle_settings_input(key: int, state: dict) -> bool:
             state["all_scroll_manual"] = False
             return True
         return False
+
+    if key in (ord("l"), ord("L")):
+        state["settings_alarm_enabled"] = not state.get("settings_alarm_enabled", True)
+        state["settings_alarm_field"] = "alarm"
+        return True
+
+    if key in (ord("n"), ord("N")):
+        state["settings_sound_enabled"] = not state.get("settings_sound_enabled", True)
+        state["settings_alarm_field"] = "sound"
+        return True
+
+    if key in (curses.KEY_LEFT, ord("-"), 95):
+        adjust_alarm_field(state, -1)
+        return True
+    if key in (curses.KEY_RIGHT, ord("+"), ord("=")):
+        adjust_alarm_field(state, 1)
+        return True
 
     if key in (ord("q"), ord("Q")):
         cancel_settings(state)
@@ -2432,7 +2787,7 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
         pass
 
     all_zones_set = set(available_timezones())
-    selected, box_mode, colors_pref, theme_name = load_config(all_zones_set)
+    selected, box_mode, colors_pref, theme_name, alarm_cfg = load_config(all_zones_set)
 
     country_map, country_err = load_country_timezones(all_zones_set)
 
@@ -2458,6 +2813,10 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
         "duration_str": "",
         "total_minutes": 0,
         "quit": False,
+        "alarm": AlarmState(),
+        "alarm_duration": int(alarm_cfg.get("alarm_duration", ALARM_DURATION_DEFAULT)),
+        "beep_interval": int(alarm_cfg.get("beep_interval", BEEP_INTERVAL_DEFAULT)),
+        "beep_max": int(alarm_cfg.get("beep_max", BEEP_MAX_DEFAULT)),
         "flash_until": {},
         "help_open": False,
         "regions": [],
@@ -2494,6 +2853,9 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
         "settings_theme": theme_name,
     }
 
+    state["alarm"].enabled = bool(alarm_cfg.get("alarm_enabled", True))
+    state["alarm"].sound_enabled = bool(alarm_cfg.get("sound_enabled", True))
+
     init_color_support(state)
     if args.no_color:
         colors_pref = False
@@ -2516,9 +2878,26 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
     last_tick = 0.0
     while not state["quit"]:
         now = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
         key = stdscr.getch()
 
         changed = False
+        alarm_changed = update_alarm(state, now_utc, now)
+        alarm = state["alarm"]
+        if alarm.just_triggered:
+            alarm_flash()
+            if alarm.sound_enabled:
+                alarm_beep(state)
+                alarm.last_beep_monotonic = now
+                alarm.beeps_sent = max(alarm.beeps_sent, 1)
+        if alarm.active and alarm.sound_enabled:
+            interval = max(1, int(state.get("beep_interval", BEEP_INTERVAL_DEFAULT)))
+            max_beeps = max(1, int(state.get("beep_max", BEEP_MAX_DEFAULT)))
+            if alarm.beeps_sent < max_beeps:
+                if alarm.last_beep_monotonic is None or (now - alarm.last_beep_monotonic) >= interval:
+                    alarm_beep(state)
+                    alarm.last_beep_monotonic = now
+                    alarm.beeps_sent += 1
         if key == curses.KEY_MOUSE and state.get("mouse_enabled"):
             try:
                 _, mx, my, _, bstate = curses.getmouse()
@@ -2534,7 +2913,7 @@ def main(stdscr: curses.window, args: argparse.Namespace) -> None:
             else:
                 changed = handle_main_input(key, state)
 
-        if int(now) != int(last_tick) or changed:
+        if int(now) != int(last_tick) or changed or alarm_changed:
             last_tick = now
             if state["settings_open"]:
                 render_settings(stdscr, state)
